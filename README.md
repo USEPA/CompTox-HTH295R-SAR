@@ -21,7 +21,7 @@ The code included here for Foster et al. enables the following analysis:
 
 3. How users can get started with the project.
 
-Users can see the code in the .Rmd file and the Supp Files 1 and 2 have all required inputs. If it is not desired to run the code, the user can refer to the knitted .html file that includes all of the outputs of the code.
+Users can see the code in the .Rmd file and the Supp File 2 has all required inputs. If it is not desired to run the code, the user can refer to the knitted .html file (Supp File 1) that includes all of the outputs of the code.
 
 4. Where users can get help with the project.
 
