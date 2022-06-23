@@ -1,0 +1,4021 @@
+---
+title: "Evaluating structure-based activity in a high-throughput assay for steroid biosynthesis: Code"
+author: "Foster MJ, Patlewicz G, Shah I, Haggard DE, Judson RS, Paul Friedman K"
+output:
+  html_document:
+    code_folding: hide
+    collapsed: yes
+    df_print: paged
+    lightbox: no
+    number_sections: no
+    self_contained: yes
+    thumbnails: no
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, include=TRUE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(tidyr)
+library(dplyr)
+library(gplots)
+library(purrr)
+library(janitor)
+library(naniar)
+library(gtools)
+library(randomForest)
+library(caret)
+library(BBmisc)
+library(knitr)
+library(class)
+library(mlbench)
+library(stringr)
+library(kableExtra)
+library(rcdk)
+library(fingerprint)
+library(ggvenn)
+library(readxl)
+library(ggbreak)
+library(gplots)
+library(grid)
+library(gridExtra)
+library(gtable)
+```
+
+# R Session Information 
+
+```{r}
+sessionInfo()
+```
+
+
+# Data Import and Prep {.tabset .tabset-fade .tabset-pills}
+
+```{r message=FALSE, warning=FALSE}
+
+load("/ccte/home2/mfoster/HTH295RCode/hth295r_bioactivity.RData")
+
+
+setwd("/ccte/home2/mfoster/HTH295RCode")
+
+toxprints<-read_excel(path = "Supp2_Inputdata_Foster_etal_HTH295R_QSAR.xlsx", sheet = 1)
+#toxprints for hth295r chemicals, sc and mc 
+opera<-read_excel(path = "Supp2_Inputdata_Foster_etal_HTH295R_QSAR.xlsx", sheet = 2)
+#opera for mc chemicals
+operanegs<-read_excel(path = "Supp2_Inputdata_Foster_etal_HTH295R_QSAR.xlsx", sheet = 3)
+#opera for artificial negative chemicals
+operanegs<-(operanegs[!duplicated(operanegs), ])
+
+smiles1<-read_excel(path = "Supp2_Inputdata_Foster_etal_HTH295R_QSAR.xlsx", sheet = 4)
+#smiles for the ~1400 structurable chemicals
+classyfire<-read_excel(path = "Supp2_Inputdata_Foster_etal_HTH295R_QSAR.xlsx", sheet = 5)
+#classyfire for hth295r and edsp chemicals
+dtxsidclassyfire<-read_excel(path = "Supp2_Inputdata_Foster_etal_HTH295R_QSAR.xlsx", sheet = 6)
+#dtxsids for all the chemicals with classyfire data
+fold<-read_excel(path = "Supp2_Inputdata_Foster_etal_HTH295R_QSAR.xlsx", sheet = 7)
+#fold changes for chemicals with androgen and estrogen data
+testchems<-read_excel(path = "Supp2_Inputdata_Foster_etal_HTH295R_QSAR.xlsx", sheet = 8)
+#toxprints for edsp chemicals
+tcs<-read_excel(path = "Supp2_Inputdata_Foster_etal_HTH295R_QSAR.xlsx", sheet = 9)
+#smiles for edsp chemicals
+otc<-read_excel(path = "Supp2_Inputdata_Foster_etal_HTH295R_QSAR.xlsx", sheet = 10)
+```
+
+
+## Cleaning sc data and calculating hits
+
+A hit is as defined as where a chemical perturbs a single hormone. 
+
+```{r Cleaning single conc data and calculating hits for both, message=FALSE, warning=FALSE}
+
+sc.h295r[,n.assays.pos := sum(hitc), by=list(spid)]
+sc.h295r[, steroid.hitc := 0]
+sc.h295r[n.assays.pos > 2 , steroid.hitc := 1]
+
+#negative chemicals have a maxmMd under the critical value
+neg<-filter(mMd.h295r, maxmMd < criticalVal)
+
+#substances unique to single conc
+scchems<-unique(sc.h295r$dsstox_substance_id)
+#substance unique to multi conc
+mcchems<-unique(mMd.h295r$dsstox_substance_id)
+
+#grouping by substance, seeing how many hits
+hitsum <- sc.h295r %>%
+  group_by(dsstox_substance_id) %>% 
+  summarise(sum=sum(hitc))
+hitsum<-data.frame(hitsum)
+```
+
+## Cleaning toxprints
+
+Filtering out NAs, filtering out toxprints that are not present etc.
+
+```{r Cleaning toxprints, message=FALSE, warning=FALSE}
+#setting NA to 2
+toxprints[is.na(toxprints)] <- 2
+
+#creating the hit column
+toxprints$steroid.hitc <- sc.h295r$steroid.hitc[match(toxprints$DTXSID,sc.h295r$dsstox_substance_id)]
+
+#setting rownames to chemical IDs
+row.names(toxprints) <- toxprints$DTXSID 
+
+#getting an all numeric matrix
+tp.matrix <- toxprints[,4:732]
+tp.matrix <-sapply(tp.matrix, as.numeric)
+rownames(tp.matrix) <- toxprints$PREFERRED_NAME
+tp.matrixcc <- na.omit(tp.matrix)
+
+#filtering out toxprints that have no chemicals with that feature
+tp.matrixcc1 = tp.matrixcc[,colSums(tp.matrixcc) > 0]
+
+#turning back into a data frame, adding chnm column
+tpdf<-data.frame(tp.matrixcc1)
+tpdf$chnm<-rownames(tpdf)
+```
+
+## Merging toxprints and mc data
+
+```{r adding multiconc to toxprints, message=FALSE, warning=FALSE}
+
+#adding toxprints to multiconc
+mctp<-left_join(mMd.h295r,tpdf,by="chnm")
+
+#creating a "status" column to characterize positive and negative
+mctp <-mctp %>% mutate(status = "positive")
+mctp<-mctp %>% mutate(status = replace(status, maxmMd < criticalVal, "negative"))
+
+#creating categories for positive
+mctp<-mctp %>% mutate(status = replace(status, status=="positive", "middle"))
+
+#low and high are determined by splitting the data into 3rds
+low<-3.848106
+high<-7.858948
+mctp<-mctp %>% mutate(status = replace(status, maxmMd<low, "low"))
+mctp<-mctp %>% mutate(status = replace(status, maxmMd>high, "high"))
+mctp<-mctp %>% mutate(status = replace(status, maxmMd < criticalVal, "negative"))
+
+tpdf$chnm<-rownames(tpdf)
+tpdf2<-dplyr::select(tpdf, -matches("chnm"), -matches("names"))
+
+```
+
+## Artificial Negatives
+
+Artificial negatives are defined as chemicals with less than 3 hits, no hits in an estrogen or androgen, and having a max med value with in 1 SD of the mean. We find 890 chemicals that meet this criteria.
+
+```{r start of artifical negative calculations,message=FALSE, warning=FALSE }
+#filtering chemicals with less than 3 hits
+uniquesc<-setdiff(scchems, mcchems)
+negsums<-filter(hitsum, sum<3)
+
+
+#no hits in E or A
+negsc<-subset(sc.h295r, dsstox_substance_id %in% negsums$dsstox_substance_id)
+negsc<-subset(negsc, dsstox_substance_id %in% uniquesc)
+
+noET<-filter(negsc, aeid!="914",aeid!="915",aeid!="906",aeid!="907")
+
+#with in one SD of the mean max med value
+artnegs<-filter(noET, max_med<0.8657488, max_med>0.3042512)
+
+
+```
+
+## Adding artificial negatives to mc
+
+
+```{r adding artifical negatives to the multiconc data,message=FALSE, warning=FALSE}
+
+#selecting only ID variables
+artnegs2<-dplyr::select(artnegs, matches("dsstox_substance_id"), matches("chnm"),matches("casn"))
+
+#creating new columns for joining the two data frames together
+artnegs2 <-artnegs2 %>% mutate(status = "negative")
+artnegs2 <-artnegs2 %>% mutate(date = NA) %>% mutate(plate = NA) %>% 
+  mutate(date_chnm_plate = NA) %>% 
+  mutate(conc_index = NA) %>% 
+  mutate(conc = NA) %>% 
+  mutate(OHPREG = NA) %>% 
+  mutate(PROG = NA) %>% 
+  mutate(OHPROG = NA) %>% 
+  mutate(DOC = NA) %>% 
+  mutate(CORTIC = NA) %>% 
+  mutate(X11DCORT = NA) %>% 
+  mutate(CORT = NA) %>% 
+  mutate(ANDR = NA) %>% 
+  mutate(TESTO = NA) %>% 
+  mutate(E1 = NA) %>% 
+  mutate(E2 = NA) %>% 
+  mutate(mMd = NA) %>% 
+  mutate(maxmMd = 1.643) %>% 
+  mutate(BMD = NA) %>% 
+  mutate(criticalVal = 1.643)
+
+#adding the artificial negatives to the toxprints
+sctp<-left_join(artnegs2,tpdf,by="chnm")
+
+#adding in multiconc data
+mctp_negs<-data.frame(rbind(sctp,mctp))
+
+#making a new column of binary status, just positive and negative
+mctp_negs <-mctp_negs %>% mutate(statusNP = "positive")
+mctp_negs<-mctp_negs %>% mutate(statusNP = replace(statusNP, status=="negative", "negative"))
+
+mctp_negs <-mctp_negs %>% mutate(status01 = 1)
+mctp_negs<-mctp_negs %>% mutate(status01 = replace(status01, statusNP=="negative", 0))
+
+mctp_negs$status01<-as.numeric(mctp_negs$status01)
+
+```
+
+## Changing the disagreements to negatives so each chemical only has one outcome either positive or negative
+
+12 chemicals had disagreements, ie at one concentration they are positive and the other they are negative. We decided to change these to negatives because the positive values are relatively close to their critical values.
+
+```{r Changing the disagreements to negatives so each chemical only has one outcome either positive or negative (mctp),message=FALSE, warning=FALSE,  include=T}
+
+#taking the mean of status by chemical, those chemicals with no disagreements should have 1 or 0
+disM<-mctp_negs %>% 
+  group_by(chnm) %>% 
+  summarise(mean(status01))
+
+
+
+#picking out disagreeing chemicals
+disM2<-subset(disM,`mean(status01)`<1&`mean(status01)`>0)
+
+#changing disagreements to negatives
+mctp_negsdis<- mctp_negs %>% mutate(statusNP = replace(statusNP, chnm %in% disM2$chnm, "negative"))
+#erasing status01
+mctp_negsdis<-dplyr::select(mctp_negsdis,-"status01")
+
+
+#getting rid of duplicated columns
+dup<-which(duplicated(mctp_negsdis)==FALSE)
+mctp_negsdis<-mctp_negsdis[dup,]
+
+#recreating status01
+mctp_negsdis <-mctp_negsdis %>% mutate(status01 = 0)
+mctp_negsdis<-mctp_negsdis %>% mutate(status01 = replace(status01, statusNP=="positive", 1))
+```
+
+## Opera data cleaning
+
+Table shows the distribution of positive and negative chemicals. The total number of chemicals that have opera and toxprints is 1400.
+
+```{r Reading in opera data,message=FALSE, warning=FALSE }
+#combining positive and negative chemicals
+opera2<-data.frame(rbind(opera, operanegs))
+colnames(opera2)[4]<-"chnm"
+#joining toxprint and opera data
+operafull<-left_join(opera2, mctp_negs, by="chnm")
+
+#cutting out unnecessary columns
+operafull2<-dplyr::select(operafull, c(4:17,41:556))
+
+#creating a numeric status column, 0 for negative, 1 for positive
+operafull2 <-operafull2 %>% mutate(status01 = 0)
+operafull2<-operafull2 %>% mutate(status01 = replace(status01, statusNP=="positive", 1))
+
+#preparing for random forest modeling
+operafull2<-na.omit(operafull2)
+operafull2$statusNP<-as.factor(operafull2$statusNP)
+operafull2[,2:14]<-sapply(operafull2[,2:14], as.numeric)
+operafull2<-operafull2[!duplicated(operafull2), ]
+operafull2_2<-operafull2
+operafull2_2$rownums<-1:nrow(operafull2)
+
+# Changing the disagreements to negatives so each chemical only has one outcome either positive or negative
+
+#finding which chemicals disagree
+dis<-operafull2 %>% 
+  group_by(chnm) %>% 
+  summarise(mean(status01))
+
+dis2<-subset(dis,`mean(status01)`<1&`mean(status01)`>0)
+
+#changing anything in the dis2 vector (12 chems) to negative
+operafull2dis<- operafull2 %>% mutate(statusNP = replace(statusNP, chnm %in% dis2$chnm, "negative"))
+operafull2dis<-dplyr::select(operafull2dis,-"status01")
+
+#cutting out duplicates
+dup<-which(duplicated(operafull2dis)==FALSE)
+operafull2dis<-operafull2dis[dup,]
+
+
+operafull2dis <-operafull2dis %>% mutate(status01 = 0)
+operafull2dis<-operafull2dis %>% mutate(status01 = replace(status01, statusNP=="positive", 1))
+
+operafull2dis<-na.omit(operafull2dis)
+operafull2dis<-remove_constant(operafull2dis)
+operafull2dis %>% 
+   group_by(statusNP) %>% 
+  summarise(NumChemicals = length(unique(chnm)))
+
+#outputting a data frame for reference 
+neg_op<-subset(operafull2dis, statusNP=="negative")
+realnegs<-subset(neg_op, chnm %in% mMd.h295r$chnm)
+fakenegs<-subset(neg_op, !(chnm %in% realnegs$chnm))
+
+
+
+
+```
+
+```{r ,message=FALSE, warning=FALSE }
+#extracting the dxtsids for the 1400 test chemicals I didn't keep these in the opera data frame for some reason but I need them later
+IDs_1400<-data.frame(rbind(subset(opera, PREFERRED_NAME %in% operafull2dis$chnm),subset(operanegs, PREFERRED_NAME %in% operafull2dis$chnm)))
+
+IDs_1400<-dplyr::select(IDs_1400, PREFERRED_NAME, DTXSID)
+colnames(IDs_1400)<-c("chnm","DTXSID")
+
+IDs_1400<-arrange(IDs_1400,chnm)
+operafull2dis<-arrange(operafull2dis,chnm)
+
+training_chems<-data.frame(arrange(operafull2dis,chnm)$statusNP,arrange(IDs_1400,chnm))
+colnames(training_chems)[1]<-"statusNP"
+
+training_chems<-training_chems %>% mutate(artificial = case_when(chnm %in% fakenegs$chnm~"artifical negative",
+chnm %in% realnegs$chnm~"real negative",
+statusNP=="positive"~"positive"))
+
+train_chems_df<-operafull2dis
+train_chems_df$artificial<-training_chems$artificial
+train_chems_df$DXTSID<-training_chems$DTXSID
+```
+
+
+
+## Morgan Fingerprint data
+
+```{r ,message=FALSE, warning=FALSE }
+
+#getting getting the 1430 chemicals that are in structural models, I use this just for the chemical names in Morgan kmeans and local modeling approach. 30 of these chemicals don't have opera data.
+
+operafull2disNA<- operafull2 %>% mutate(statusNP = replace(statusNP, chnm %in% dis2$chnm, "negative"))
+operafull2disNA<-dplyr::select(operafull2disNA,-"status01")
+
+#cutting out duplicates
+dup<-which(duplicated(operafull2disNA)==FALSE)
+operafull2disNA<-operafull2disNA[dup,]
+
+
+operafull2disNA <-operafull2disNA %>% mutate(status01 = 0)
+operafull2disNA<-operafull2disNA %>% mutate(status01 = replace(status01, statusNP=="positive", 1))
+```
+
+
+```{r reading in smiles and generating fingerprints,message=FALSE, warning=FALSE }
+#taking smiles are generating fingerprints
+sg<-setdiff(operafull2disNA$chnm, operafull2dis$chnm)
+smiles1<-subset(smiles1, !(PREFERRED_NAME %in% sg))
+mols <- parse.smiles(smiles1$QSAR_READY_SMILES)
+fps <- lapply(mols, get.fingerprint)
+fpsM<-fp.to.matrix(fps)
+```
+
+
+```{r data cleaning morgan,message=FALSE, warning=FALSE }
+#converting to a data frame
+fpsMdf<-data.frame(fpsM)
+
+#adding a column for chemical name
+fpsMdf$chnm<-operafull2dis$chnm
+
+#adding the opera features
+xx<-colnames(operafull2disNA)[2:14]
+fpsMdf[xx]<-NA
+fpsMdf[,1026:1038]<-operafull2disNA[,2:14]
+
+#adding bioactivity
+fpsMdf$statusNP<-operafull2dis$statusNP
+fpsMdf$rownums<-1:nrow(fpsMdf)
+
+#cutting out NAs
+fpsMdf<-na.omit(fpsMdf)
+```
+
+
+# Enrichment {.tabset .tabset-fade .tabset-pills}
+
+We performed enrichment analysis using 2x2 tables and fisher's exact test to see if there is any relationship between chemotypes and bioactivity. The top 10 largest and smallest odds ratios are listed in the tables below.
+
+```{r,message=FALSE, warning=FALSE }
+#for loop that calculates fisher's test, outputs p value, estimate and confidence interval
+ dataft<-matrix(NA, ncol=4, nrow=455)
+ for(i in 15:469){
+   tf<-table(operafull2dis[,i]==1, operafull2dis$status01)
+   fttf<-fisher.test(tf)
+   dataft[i-14,]<-c(fttf$p.value, fttf$estimate, fttf$conf.int)
+ }
+ 
+ #constructing the data frame
+ colnames(dataft)<-c("Pval","Odds_Ratio","Lower","Upper")
+ 
+ dataft<-data.frame(dataft)
+ 
+ dataft$padj<-p.adjust(dataft$Pval, method="fdr")
+ dataft$feature<-colnames(operafull2dis[,15:469])
+ 
+ #filtering significant results
+ sigor<-filter(dataft, padj<.01,Odds_Ratio!=Inf, Odds_Ratio!=0)
+ sigorORF<-dplyr::select(sigor, Odds_Ratio, feature)
+ sigorORF$Odds_Ratio<-as.numeric(sigorORF$Odds_Ratio)
+ sigorORF<-(arrange(sigorORF, Odds_Ratio))
+ 
+arrange(sigor, desc(Odds_Ratio))[1:10,]
+arrange(sigor, Odds_Ratio)[1:10,]
+
+```
+
+
+## Counting instances of enriched chemotypes in our chemical space
+
+```{r,message=FALSE, warning=FALSE }
+#selecting/subsetting chemotypes with the top 10 odds ratios in the enrichment dataset and then counting the number of using colSums
+
+e_chemo_tab_up<-colSums(subset(operafull2dis, select=arrange(sigor, desc(Odds_Ratio))[1:10,6]))
+
+#here is the same but without desc so the lowest 10 odds ratios
+e_chemo_tab_down<-colSums(subset(operafull2dis,select=arrange(sigor, Odds_Ratio)[1:10,6]))
+
+
+```
+
+Enriched in positive space `r e_chemo_tab_up`.
+
+Enriched in negative space `r e_chemo_tab_down`.
+
+
+# Random Forest models {.tabset .tabset-fade .tabset-pills}
+
+
+## Function for doing cross validation
+```{r,message=FALSE, warning=FALSE }
+#writing a function to run cross validation to change the seed, mtry, the formula and data. Will run LOOCV. We run two separate CVs here because caret does not calculate sens and spef and accuracy in the same method.
+
+rf_rep_cv<-function(seed, mtry1, formula, data1){
+  #sets leave one out, and sens/spec
+  control <- trainControl(method="LOOCV",
+                        summaryFunction = twoClassSummary,
+                      classProbs = TRUE,
+                           savePredictions='all')
+set.seed(seed)
+mtry <- mtry1
+tunegrid <- expand.grid(.mtry=mtry)
+rf_default2 <- train(formula, 
+                      data=data1,
+                     metric="ROC",
+                      method='rf',
+                     tuneGrid=tunegrid,
+                      trControl=control)
+#need to do it again to get kappa, change metric to accuracy instead of ROC
+ control2 <- trainControl(method="LOOCV",
+                        summaryFunction = twoClassSummary,
+                      classProbs = TRUE,
+                           savePredictions='all')
+rf_default3 <- train(formula, 
+                      data=data1,
+                     metric="Accuracy",
+                      method='rf',
+                     tuneGrid=tunegrid,
+                      trControl=control2)
+acc<-((rf_default2$results[3]+rf_default2$results[4])/2)
+oob<-1-acc
+
+c(rf_default2$results[,3:4],acc,rf_default3$results[3],oob)
+}
+
+```
+
+## Function for replicating importance
+
+
+```{r 100 reps of importance function,message=FALSE, warning=FALSE }
+
+impreptot<-function(formula, data, mtry){
+imprep<-function(x){
+set.seed(x)
+train<-sample(1:1400, size=1050)
+rf2 <- randomForest(formula,data=data,mtry=mtry,ntree=500, importance=T, na.action = na.omit)
+
+imp<-data.frame(importance(rf2))
+
+#sorting variables by mean decrease accuracy 
+imp<-arrange(imp, desc(MeanDecreaseAccuracy))[,3:4]
+
+#adding column for opera feature names
+imp$feat<-rownames(imp)
+
+#adding column for rank of feature
+imp$rank<-1:nrow(imp)
+
+#outputting name and rank
+imp[,3:4]
+}
+
+opfeatJ<-data.frame(colnames(data)[2:469])
+colnames(opfeatJ)<-"feature"
+#creating a matrix to store the ranks for 100 replications
+rfrepdataIMP<-data.frame(matrix(NA, ncol=101, nrow=length(opfeatJ$feature)))
+rfrepdataIMP[,1]<-opfeatJ$feature
+
+#running 100 replications
+reppy2<-sapply(1:100,imprep)
+
+#function that gets all the 100 data frames in the same order of features
+eh2<-function(x,y){
+a<-data.frame(reppy2[[x]],reppy2[[y]])
+colnames(a)<-c("feature","rank")
+b<-left_join(opfeatJ, a, by="feature")
+b
+}
+
+#running ordering function
+xx2<-mapply(eh2, x=seq(from=1, to=199, by=2), y=seq(from=2, to=200,by=2))
+
+
+#combining all 100 lists from above
+for(i in 1:100){
+  wid<-data.frame(xx2[,i])
+  rfrepdataIMP[,i+1]<-wid$rank
+}
+
+#taking means of ranks
+ranksopera<-data.frame(cbind(rfrepdataIMP[,1],rowMeans(rfrepdataIMP[,2:101])))
+
+#outputting results
+ranksopera[,2]<-as.numeric(ranksopera[,2])
+colnames(ranksopera)<-c("Feature","Rank")
+#arranged most important to least
+ranksopera<-arrange(ranksopera, Rank)
+
+ranksopera
+}
+```
+
+## Making sure the outcome is in the right order for modeling
+
+```{r,message=FALSE, warning=FALSE }
+operafull2dis$statusNP<-relevel(operafull2dis$statusNP, ref="positive")
+
+fpsMdf$statusNP<-relevel(fpsMdf$statusNP, ref="positive")
+
+```
+
+
+
+## OPERA only
+```{r eval=F,message=FALSE, warning=FALSE }
+#setting formula with only opera features
+operaform<-as.formula(statusNP~OCTANOL_WATER_PARTITION_LOGP_OPERA_PRED+AVERAGE_MASS+ATMOSPHERIC_HYDROXYLATION_RATE_.AOH._CM3.MOLECULE.SEC_OPERA_PRED+BIOCONCENTRATION_FACTOR_OPERA_PRED  +BIODEGRADATION_HALF_LIFE_DAYS_DAYS_OPERA_PRED+
+BOILING_POINT_DEGC_OPERA_PRED+HENRYS_LAW_ATM.M3.MOLE_OPERA_PRED+OPERA_KM_DAYS_OPERA_PRED+OCTANOL_AIR_PARTITION_COEFF_LOGKOA_OPERA_PRED+SOIL_ADSORPTION_COEFFICIENT_KOC_L.KG_OPERA_PRED+MELTING_POINT_DEGC_OPERA_PRED+VAPOR_PRESSURE_MMHG_OPERA_PRED+WATER_SOLUBILITY_MOL.L_OPERA_PRED)
+
+#importing formula into the function that runs the random forest LOOCV, can set any seed or mtry, ntree is fixed at 500
+opera_rep_cv<-rf_rep_cv(seed=12, mtry1=sqrt(13),formula =operaform, data1=operafull2dis)
+opera_rep_cv
+
+
+
+```
+
+
+## Chemotypes only
+```{r eval=F,message=FALSE, warning=FALSE }
+#same idea as above but with chemotypes
+chemoform<-as.formula(statusNP~.-chnm-status01-AVERAGE_MASS -ATMOSPHERIC_HYDROXYLATION_RATE_.AOH._CM3.MOLECULE.SEC_OPERA_PRED-BIOCONCENTRATION_FACTOR_OPERA_PRED-BIODEGRADATION_HALF_LIFE_DAYS_DAYS_OPERA_PRED-BOILING_POINT_DEGC_OPERA_PRED-HENRYS_LAW_ATM.M3.MOLE_OPERA_PRED-OPERA_KM_DAYS_OPERA_PRED-OCTANOL_AIR_PARTITION_COEFF_LOGKOA_OPERA_PRED-SOIL_ADSORPTION_COEFFICIENT_KOC_L.KG_OPERA_PRED-OCTANOL_WATER_PARTITION_LOGP_OPERA_PRED-MELTING_POINT_DEGC_OPERA_PRED-VAPOR_PRESSURE_MMHG_OPERA_PRED-WATER_SOLUBILITY_MOL.L_OPERA_PRED)
+
+chemo_rep_cv<-rf_rep_cv(seed=12, mtry1=sqrt(455),formula =chemoform, data1=operafull2dis)
+
+```
+
+
+
+
+## With both chemotypes and OPERA
+```{r eval=F,message=FALSE, warning=FALSE }
+ocform<-as.formula(statusNP~.-chnm-status01)
+
+oc_rep_cv<-rf_rep_cv(seed=12, mtry1=sqrt(468),formula =ocform , data1=operafull2dis)
+
+
+```
+
+## Morgan and OPERA
+```{r eval=F,message=FALSE, warning=FALSE }
+moform<-as.formula(statusNP~.-chnm-rownums)
+mo_rep_cv<-rf_rep_cv(seed=12, mtry1=sqrt(1037),formula=moform, data1=fpsMdf)
+```
+
+## Morgan only
+```{r eval=F,message=FALSE, warning=FALSE }
+morganform<- as.formula(statusNP~.-chnm-rownums-OCTANOL_WATER_PARTITION_LOGP_OPERA_PRED-AVERAGE_MASS-ATMOSPHERIC_HYDROXYLATION_RATE_.AOH._CM3.MOLECULE.SEC_OPERA_PRED-BIOCONCENTRATION_FACTOR_OPERA_PRED  -BIODEGRADATION_HALF_LIFE_DAYS_DAYS_OPERA_PRED-
+BOILING_POINT_DEGC_OPERA_PRED-HENRYS_LAW_ATM.M3.MOLE_OPERA_PRED-OPERA_KM_DAYS_OPERA_PRED-OCTANOL_AIR_PARTITION_COEFF_LOGKOA_OPERA_PRED-SOIL_ADSORPTION_COEFFICIENT_KOC_L.KG_OPERA_PRED-MELTING_POINT_DEGC_OPERA_PRED-VAPOR_PRESSURE_MMHG_OPERA_PRED-WATER_SOLUBILITY_MOL.L_OPERA_PRED)
+
+morgan_rep_cv<-rf_rep_cv(seed=12, mtry1=sqrt(1024),formula=morganform, data1=fpsMdf)
+```
+
+## Results from cross validation of RF models
+
+LOOCV Results
+
+```{r eval=F,message=FALSE, warning=FALSE }
+#combining all the LOOCV results
+cv_results<-rbind(as.vector(opera_rep_cv), as.vector(chemo_rep_cv), as.vector(oc_rep_cv), as.vector(morgan_rep_cv), as.vector(mo_rep_cv))
+colnames(cv_results)<-c("Sensitivity","Specificity","Accuracy","Kappa","OOB")
+rownames(cv_results)<-c("OPERA","Chemotypes","OPERA and Chemotypes","OPERA and enriched","Morgan fingerprints","OPERA and Morgan")
+cv_results
+```
+
+
+
+```{r,message=FALSE, warning=FALSE }
+#inputting saved LOOCV results
+cv_results<-read_excel(path = "Supp3_RandomForest_Outputs.xlsx", sheet = 6)
+colnames(cv_results)[1]<-"Model"
+cv_results$`Number of Features`<-c(13,455,468,1024,1037)
+cv_results
+```
+
+
+## Importance for RF models
+
+```{r eval=F,message=FALSE, warning=FALSE }
+#using importance function and formulas from above to output average ranks of importance for each model
+operaimportance<-impreptot(operaform,operafull2dis,sqrt(13))
+chemoimportance<-impreptot(chemoform,operafull2dis,sqrt(455))
+
+ocimportance<-impreptot(ocform,operafull2dis,sqrt(468))
+
+
+
+imptable<-data.frame(cbind(paste(operaimportance[,2],operaimportance[,1]),paste(chemoimportance[,2],chemoimportance[,1]),paste(ocimportance[,2],ocimportance[,1])))
+colnames(imptable)<-c("Opera","Chemotypes","Opera+Chemotypes")
+
+```
+
+
+
+```{r,message=FALSE, warning=FALSE }
+#reading in saved importance results
+imptable2<-read_excel(path = "Supp3_RandomForest_Outputs.xlsx", sheet = 1)
+
+(imptable2[1:16,-1])
+
+```
+
+# Tuning mtry and ntree {.tabset .tabset-fade .tabset-pills}
+
+## Function to tune ntree
+```{r eval=F,message=FALSE, warning=FALSE }
+
+#writing LOOCV function but this time only changing ntree and judging only on sens/spef/BA
+t_ntree<-function(x){
+ control <- trainControl(method="LOOCV",
+                        summaryFunction = twoClassSummary,
+                      classProbs = TRUE,
+                           savePredictions='all')
+set.seed(12)
+mtry <- sqrt(13)
+tunegrid <- expand.grid(.mtry=mtry)
+rf_default2 <- train(operaform, 
+                      data=operafull2dis,
+                     metric="ROC",
+                      method='rf',ntree=x,
+                     tuneGrid=tunegrid,
+                      trControl=control)
+
+rf_default2$results[c(3,4)] 
+}
+op_ntree<-sapply(seq(from=500,to=1500, by=200), t_ntree)
+
+
+op_ntree<-data.frame(t(op_ntree))
+op_ntree$trees<-seq(from=500,to=1500, by=200)
+data.frame(unlist(op_ntree))
+```
+
+## Tuning mtry 
+
+```{r eval=F,message=FALSE, warning=FALSE }
+#using LOOCV to change mtry. can use tune grid for this, no need to write an outside function.
+ control <- trainControl(method="LOOCV",
+                        summaryFunction = twoClassSummary,
+                      classProbs = TRUE,
+                           savePredictions='all')
+set.seed(12)
+mtry <- c(1,2,3,sqrt(13),4,5,7,10,15,20,25,30)
+tunegrid <- expand.grid(.mtry=mtry)
+rf_default2 <- train(operaform, 
+                      data=operafull2dis,
+                     metric="ROC",
+                      method='rf',
+                     tuneGrid=tunegrid,
+                      trControl=control)
+
+op_mtry<-rf_default2$results[c(3,4)] 
+op_mtry
+
+```
+
+## Reading saved ntree and mtry tuning and inputting into the figures, calculating standard deviations
+
+```{r,message=FALSE, warning=FALSE }
+ntree_tune<-read_excel(path = "Supp3_RandomForest_Outputs.xlsx", sheet = 7)
+
+#taking standard deviation of balanced acc. of ntree
+sd_ntree<-sd((ntree_tune$Sensitivity+ntree_tune$Specificity)/2)
+
+
+ntree_tune<-melt(ntree_tune, id.vars="Number of Trees")
+
+mtry_tune<-read_excel(path = "Supp3_RandomForest_Outputs.xlsx", sheet = 8)
+
+#taking standard deviation of balanced acc. of mtry
+sd_mtry<-sd((mtry_tune$Sensitivity+mtry_tune$Specificity)/2)
+
+mtry_tune<-melt(mtry_tune, id.vars="mtry")
+
+#re-leveling so that the colors are the same as above
+mtry_tune$variable<-relevel(mtry_tune$variable, ref = "Specificity")
+
+ntree_tune$variable<-relevel(ntree_tune$variable, ref = "Specificity")
+
+#creating the line plots
+p_ntree<-ggplot(ntree_tune, aes(y=value, x=`Number of Trees`))+geom_point(aes(color=variable, shape=variable), size=4)+ylim(0,1)+theme_bw()+labs(y="Rate", color="Rate",shape="Rate",title="A")+theme(text=element_text(size=15),axis.title = element_text(size = 17),title = element_text(size = 17),legend.text=element_text(size=17))
+
+
+p_mtry<-ggplot(mtry_tune, aes(y=value, x=mtry))+geom_point(aes(color=variable, shape=variable),size=4)+ylim(0,1)+theme_bw()+labs(y="Rate", color="Rate",shape="Rate",title="B")+geom_vline(xintercept = sqrt(13), linetype="dashed")+theme(text=element_text(size=15),axis.title = element_text(size = 17),title = element_text(size = 17),legend.text=element_text(size=17))
+
+
+
+
+#rounding sds of BAs
+sds_tune<-round(c(sd_ntree, sd_mtry),4)
+```
+
+
+```{r,message=FALSE, warning=FALSE }
+#this function allows us to use gridExtra similarly to ggarrange getting a shared legend
+
+#https://github.com/tidyverse/ggplot2/wiki/Share-a-legend-between-two-ggplot2-graphs
+
+grid_arrange_shared_legend <- function(..., nrow = 1, ncol = length(list(...)), position = c("bottom", "right")) {
+
+  plots <- list(...)
+  position <- match.arg(position)
+  g <- ggplotGrob(plots[[1]] + theme(legend.position = position))$grobs
+  legend <- g[[which(sapply(g, function(x) x$name) == "guide-box")]]
+  lheight <- sum(legend$height)
+  lwidth <- sum(legend$width)
+  gl <- lapply(plots, function(x) x + theme(legend.position = "none"))
+  gl <- c(gl, nrow = nrow, ncol = ncol)
+
+  combined <- switch(position,
+                     "bottom" = arrangeGrob(do.call(arrangeGrob, gl),
+                                            legend,
+                                            ncol = 1,
+                                            heights = unit.c(unit(1, "npc") - lheight, lheight)),
+                     "right" = arrangeGrob(do.call(arrangeGrob, gl),
+                                           legend,
+                                           ncol = 2,
+                                           widths = unit.c(unit(1, "npc") - lwidth, lwidth)))
+  grid.newpage()
+  grid.draw(combined)
+
+}
+
+#combining ntree and mtry plots
+grid_arrange_shared_legend(p_ntree, p_mtry, ncol=2)
+```
+
+The standard deviations of the balanced accuracies are `r sds_tune` for ntree and mtry respectively. 
+
+
+# RFE {.tabset .tabset-fade .tabset-pills}
+
+Recursive feature elimination takes the RF models and one by one removes the least important feature, outputs specificity and sensitivity, and then runs them again until only one feature is left.
+
+
+```{r eval=F,message=FALSE, warning=FALSE }
+operaform<-as.formula(statusNP~OCTANOL_WATER_PARTITION_LOGP_OPERA_PRED+AVERAGE_MASS+ATMOSPHERIC_HYDROXYLATION_RATE_.AOH._CM3.MOLECULE.SEC_OPERA_PRED+BIOCONCENTRATION_FACTOR_OPERA_PRED  +BIODEGRADATION_HALF_LIFE_DAYS_DAYS_OPERA_PRED+BOILING_POINT_DEGC_OPERA_PRED+HENRYS_LAW_ATM.M3.MOLE_OPERA_PRED+OPERA_KM_DAYS_OPERA_PRED+OCTANOL_AIR_PARTITION_COEFF_LOGKOA_OPERA_PRED+SOIL_ADSORPTION_COEFFICIENT_KOC_L.KG_OPERA_PRED+MELTING_POINT_DEGC_OPERA_PRED+VAPOR_PRESSURE_MMHG_OPERA_PRED+WATER_SOLUBILITY_MOL.L_OPERA_PRED)
+
+
+#running first model with all features
+rf.opera <- randomForest(operaform,data=operafull2dis, mtry=sqrt(13),ntree=500, importance=T)
+#outputting sens and spef
+cm<-confusionMatrix(rf.opera$predicted, operafull2dis$statusNP)
+sens<-cm$byClass[1]
+spef<-cm$byClass[2]
+
+#saving results into a matrix
+rfeout2<-matrix(NA, nrow=13,ncol=3)
+rfeout2[1,1:2]<-c(sens,spef)
+
+for(i in 2:13){
+#ranking features by importance via mean decrease accuracy
+  imp<-data.frame(importance(rf.opera))
+imp<-arrange(imp, MeanDecreaseAccuracy)
+rfeout2[i,3]=nrow(imp)
+#removing least important feature
+imp2<-imp[-1,]
+features<-rownames(imp2)
+#getting new mtry
+m<-ceiling(sqrt(length(features)))
+
+#new formula name
+b=paste(features, collapse="+")
+form<-as.formula(paste("statusNP~ ",b,sep = ""))
+#running new model
+rf.opera <- randomForest(form,data=operafull2dis, mtry=m,ntree=500, importance=T)
+
+#new sens and spef
+cm<-confusionMatrix(rf.opera$predicted, operafull2dis$statusNP)
+sens<-cm$byClass[1]
+spef<-cm$byClass[2]
+
+#saving sens and spef for each iteration
+rfeout2[i,1:2]<-c(sens,spef)
+}
+rfeout2
+
+
+
+```
+
+```{r eval=FALSE,message=FALSE, warning=FALSE }
+#same as above but with chemotypes instead of opera features
+chemoform<-as.formula(statusNP~.-chnm-status01-AVERAGE_MASS -ATMOSPHERIC_HYDROXYLATION_RATE_.AOH._CM3.MOLECULE.SEC_OPERA_PRED-BIOCONCENTRATION_FACTOR_OPERA_PRED-BIODEGRADATION_HALF_LIFE_DAYS_DAYS_OPERA_PRED-BOILING_POINT_DEGC_OPERA_PRED-HENRYS_LAW_ATM.M3.MOLE_OPERA_PRED-OPERA_KM_DAYS_OPERA_PRED-OCTANOL_AIR_PARTITION_COEFF_LOGKOA_OPERA_PRED-SOIL_ADSORPTION_COEFFICIENT_KOC_L.KG_OPERA_PRED-OCTANOL_WATER_PARTITION_LOGP_OPERA_PRED-MELTING_POINT_DEGC_OPERA_PRED-VAPOR_PRESSURE_MMHG_OPERA_PRED-WATER_SOLUBILITY_MOL.L_OPERA_PRED)
+
+rf.opera <- randomForest(chemoform,data=operafull2dis, mtry=sqrt(455),ntree=500, importance=T)
+cm<-confusionMatrix(rf.opera$predicted, operafull2dis$statusNP)
+sens<-cm$byClass[1]
+spef<-cm$byClass[2]
+
+rfeout2<-matrix(NA, nrow=13,ncol=3)
+rfeout2[1,1:2]<-c(sens,spef)
+
+for(i in 2:455){
+  imp<-data.frame(importance(rf.opera))
+imp<-arrange(imp, MeanDecreaseAccuracy)
+rfeout2[i,3]=nrow(imp)
+imp2<-imp[-1,]
+features<-rownames(imp2)
+m<-ceiling(sqrt(length(features)))
+
+b=paste(features, collapse="+")
+form<-as.formula(paste("statusNP~ ",b,sep = ""))
+rf.opera <- randomForest(form,data=operafull2dis, mtry=m,ntree=500, importance=T)
+
+cm<-confusionMatrix(rf.opera$predicted, operafull2dis$statusNP)
+sens<-cm$byClass[1]
+spef<-cm$byClass[2]
+
+rfeout2[i,1:2]<-c(sens,spef)
+}
+rfeout2
+
+
+```
+
+```{r eval=F,message=FALSE, warning=FALSE }
+ocform<-as.formula(statusNP~.-chnm-status01)
+
+rf.opera <- randomForest(ocform,data=operafull2dis, mtry=sqrt(468),ntree=500, importance=T)
+cm<-confusionMatrix(rf.opera$predicted, operafull2dis$statusNP)
+sens<-cm$byClass[1]
+spef<-cm$byClass[2]
+
+rfeout2<-matrix(NA, nrow=13,ncol=3)
+rfeout2[1,1:2]<-c(sens,spef)
+
+for(i in 2:468){
+  imp<-data.frame(importance(rf.opera))
+imp<-arrange(imp, MeanDecreaseAccuracy)
+rfeout2[i,3]=nrow(imp)
+imp2<-imp[-1,]
+features<-rownames(imp2)
+m<-ceiling(sqrt(length(features)))
+
+b=paste(features, collapse="+")
+form<-as.formula(paste("statusNP~ ",b,sep = ""))
+rf.opera <- randomForest(form,data=operafull2dis, mtry=m,ntree=500, importance=T)
+
+cm<-confusionMatrix(rf.opera$predicted, operafull2dis$statusNP)
+sens<-cm$byClass[1]
+spef<-cm$byClass[2]
+
+rfeout2[i,1:2]<-c(sens,spef)
+}
+rfeout2
+
+
+```
+
+
+```{r eval=F,message=FALSE, warning=FALSE }
+#same as above but with Morgan fingerprints instead of opera features
+morganform<- as.formula(statusNP~.-chnm-rownums-OCTANOL_WATER_PARTITION_LOGP_OPERA_PRED-AVERAGE_MASS-ATMOSPHERIC_HYDROXYLATION_RATE_.AOH._CM3.MOLECULE.SEC_OPERA_PRED-BIOCONCENTRATION_FACTOR_OPERA_PRED  -BIODEGRADATION_HALF_LIFE_DAYS_DAYS_OPERA_PRED-
+BOILING_POINT_DEGC_OPERA_PRED-HENRYS_LAW_ATM.M3.MOLE_OPERA_PRED-OPERA_KM_DAYS_OPERA_PRED-OCTANOL_AIR_PARTITION_COEFF_LOGKOA_OPERA_PRED-SOIL_ADSORPTION_COEFFICIENT_KOC_L.KG_OPERA_PRED-MELTING_POINT_DEGC_OPERA_PRED-VAPOR_PRESSURE_MMHG_OPERA_PRED-WATER_SOLUBILITY_MOL.L_OPERA_PRED)
+
+rf.opera <- randomForest(ocform,data=fpsMdf, mtry=sqrt(1024),ntree=500, importance=T)
+cm<-confusionMatrix(rf.opera$predicted, fpsMdf$statusNP)
+sens<-cm$byClass[1]
+spef<-cm$byClass[2]
+
+rfeout2<-matrix(NA, nrow=13,ncol=3)
+rfeout2[1,1:2]<-c(sens,spef)
+
+for(i in 2:1024){
+  imp<-data.frame(importance(rf.opera))
+imp<-arrange(imp, MeanDecreaseAccuracy)
+rfeout2[i,3]=nrow(imp)
+imp2<-imp[-1,]
+features<-rownames(imp2)
+m<-ceiling(sqrt(length(features)))
+
+b=paste(features, collapse="+")
+form<-as.formula(paste("statusNP~ ",b,sep = ""))
+rf.opera <- randomForest(form,data=fpsMdf, mtry=m,ntree=500, importance=T)
+
+cm<-confusionMatrix(rf.opera$predicted, fpsMdf$statusNP)
+sens<-cm$byClass[1]
+spef<-cm$byClass[2]
+
+rfeout2[i,1:2]<-c(sens,spef)
+}
+rfeout2
+
+
+```
+
+
+## RFE opera plot
+
+```{r RFE saved with just opera, include=T,fig.width=10, fig.height=6,message=FALSE, warning=FALSE }
+rfeopera<-read_excel(path = "Supp3_RandomForest_Outputs.xlsx", sheet = 5)
+rfeopera<-rfeopera[,-c(1)]
+rfeopera<-as.data.frame(rfeopera)
+colnames(rfeopera)<-c("Specificity","Sensitivity","Number_of_Features")
+
+rfeopera<-melt(rfeopera, id.vars="Number_of_Features")
+
+#plotting how sens/spef changes based on number of features
+rfeplot3<-ggplot(rfeopera, aes(x=Number_of_Features, y=value))+geom_point(aes(color=variable,shape=variable),size=3)+labs(y="Rate",title = "(A) OPERA Only", x="Number of Features")+theme_bw(base_size = 30)+ylim(0,1)
+
+
+rfeplot3
+```
+
+## RFE chemotype plot
+
+```{r RFE saved with just chemotypes, include=T,fig.width=10, fig.height=6,message=FALSE, warning=FALSE }
+
+rfechemo<-read_excel(path = "Supp3_RandomForest_Outputs.xlsx", sheet = 4)
+rfechemo<-rfechemo[,-1]
+rfechemo<-as.data.frame(rfechemo)
+colnames(rfechemo)<-c("Specificity","Sensitivity","Number_of_Features")
+
+rfechemo<-melt(rfechemo, id.vars="Number_of_Features")
+
+#plotting how sens/spef changes based on number of features
+rfeplot2<-ggplot(rfechemo, aes(x=Number_of_Features, y=value))+geom_point(aes(color=variable,shape=variable),size=3)+labs(y="Rate",title = "(B) Chemotypes Only", x="Number of Features")+theme_bw(base_size = 30)+ylim(0,1)+scale_x_cut(breaks=c(35), which=c(1), scales=c(1))
+
+
+rfeplot2
+```
+
+
+
+## RFE full plot
+
+```{r RFE full saved data and plot, include=T, fig.width=10, fig.height=6,message=FALSE, warning=FALSE }
+#outputting saved model data into plots
+rfe<-read_excel(path = "Supp3_RandomForest_Outputs.xlsx", sheet = 3)
+rfe<-rfe[,-1]
+colnames(rfe)<-c("Specificity","Sensitivity","Number_of_Features")
+
+rfe<-melt(rfe, id.vars="Number_of_Features")
+
+#plotting how sens/spef changes based on number of features
+rfeplot1<-ggplot(rfe, aes(x=Number_of_Features, y=value))+geom_point(aes(color=variable,shape=variable),size=3)+labs(y="Rate",title = "(C) OPERA and Chemotypes", x="Number of Features")+theme_bw(base_size = 30)+ylim(0,1)+scale_x_cut(breaks=c(14), which=c(.1), scales=c(.1))
+
+
+rfeplot1
+```
+
+## RFE Morgan plot
+
+```{r,fig.width=10, fig.height=6,message=FALSE, warning=FALSE }
+rfeM<-read_excel(path = "Supp3_RandomForest_Outputs.xlsx", sheet = 2)
+
+rfeM<-rfeM[,-1]
+colnames(rfeM)<-c("Specificity","Sensitivity","Number_of_Features")
+
+rfeM<-melt(rfeM, id.vars="Number_of_Features")
+
+#plotting how sens/spef changes based on number of features
+rfeplotMorgan<-ggplot(rfeM, aes(x=Number_of_Features, y=value))+geom_point(aes(color=variable,shape=variable),size=3)+labs(y="Rate",title = "(D) Morgan Fingerprints Only", x="Number of Features")+theme_bw()+theme_bw(base_size = 30)+ylim(0,1)+scale_x_cut(breaks=c(35), which=c(1), scales=c(1))
+
+rfeplotMorgan
+```
+
+
+# Nearest Neighbor models {.tabset .tabset-fade .tabset-pills}
+
+```{r prepping for jaccard,message=FALSE, warning=FALSE }
+#isolating chemotypes
+operachemo<-operafull2dis[,c(1,15:469)]
+#getting rid of duplicates
+operachemo<-operachemo[!duplicated(operachemo),]
+rownames(operachemo)<-operachemo$chnm
+operachemo<-operachemo[,-1]
+operachemo<-na.omit(operachemo)
+```
+
+## Generating jaccard matrix for chemotypes
+
+Generates jaccard distance between all chemicals based on their chemotypes
+
+```{r Generating jaccard values takes hours to days, include=T, eval=F,message=FALSE, warning=FALSE }
+
+#function that calculates the jaccard value
+ji <- function(M, x,y) {
+  sums = colSums(M[c(x,y),])
+
+  similarity = length(sums[sums==2])
+  total = length(sums[sums==1]) + similarity
+
+  similarity/total
+}
+
+#calculating jaccard value for every combination of chemicals
+ jaccard<-matrix(NA, ncol = 1400,nrow=1400)
+ for (i in 1:1400){
+   for(j in 1:1400){
+     jaccard[i,j]<-ji(operachemo,i,j)
+   }
+ }
+
+
+#changing diagonals to 0
+for(i in 1:1400){
+  jaccard[i,i]=0
+}
+
+
+```
+
+```{r reading in jaccard data,message=FALSE, warning=FALSE }
+jaccard<-read_excel(path = "Supp4_Nearest_Neighbor_Outputs.xlsx", sheet = 1)
+jaccard<-jaccard[,-1]
+jaccard<-data.frame(jaccard)
+rownames(jaccard)<-operafull2dis$chnm
+colnames(jaccard)<-operafull2dis$chnm
+```
+
+
+
+## Tuning jaccard chemotype model
+
+Running the Morgan model at 1,2,3,4,5,6,7,10,12,12,15,20,25,30,35,40 neighbors and intersections of .1,.2 lower, .7,.8,.9 upper cutoffs
+
+```{r changing cut off values, eval=F,message=FALSE, warning=FALSE }
+#function that takes chemical name x and outputs the genera prediction, for z number of neighbors at k,y threshold values
+d1234<-function(z){
+nebJ<-function(x){
+g<-which(colnames(jaccard)==x)
+g2<-data.frame(jaccard[,g],rownames(jaccard))
+g2<-arrange(g2, desc(jaccard...g.))
+g3<-slice(g2, 1:z)
+g6<-subset(operafull2dis, chnm %in% g3$rownames.jaccard.)
+g3<-arrange(g3, rownames.jaccard.)
+g6<-arrange(g6, chnm)
+sum(g3$jaccard...g.*g6$status01)/sum(g3$jaccard...g.)
+}
+
+#running function for all chemicals
+xchemo<-data.frame(sapply(operafull2dis$chnm, nebJ))
+xchemo$chnm<-operafull2dis$chnm
+
+#setting the threshold for positive/negative outcomes
+thr3<-function(k,y){
+xchemo <- xchemo %>% mutate(sapply.operafull2dis.chnm..nebJ. = case_when(sapply.operafull2dis.chnm..nebJ. >k ~1
+,sapply.operafull2dis.chnm..nebJ. <y ~0))
+
+#confusion matrix
+c<-confusionMatrix(as.factor(xchemo$sapply.operafull2dis.chnm..nebJ.), as.factor(operafull2dis$status01),positive="1")
+#outputting sens and spef
+sens<-c$byClass[1]
+spef<-c$byClass[2]
+
+hh<-c(spef,sens,sum(c$table),mean(c(spef,sens)))
+
+hh
+}
+
+
+wow4<-mapply(thr3, c(.7,.8,.9), .2)
+wow4<-t(wow4)
+colnames(wow4)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+wow5<-mapply(thr3, c(.7,.8,.9), .1)
+wow5<-t(wow5)
+colnames(wow5)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+thrd<-data.frame(rbind(wow4,wow5))
+
+thrd$upper<-rep(c(.7,.8,.9),2)
+thrd$lower<-c(rep(.2,3),rep(.1,3))
+
+thrd
+
+}
+
+#variable being changed is number of neighbors so here were running for 1,2,3,4,5,6,7,10,12,12,15,20,25,30,35,40
+tune1<-d1234(1)
+tune2<-d1234(2)
+tune3<-d1234(3)
+tune4<-d1234(4)
+tune5<-d1234(5)
+tune6<-d1234(6)
+tune7<-d1234(7)
+tune10<-d1234(10)
+tune12<-d1234(12)
+tune15<-d1234(15)
+tune20<-d1234(20)
+tune25<-d1234(25)
+tune30<-d1234(30)
+tune35<-d1234(35)
+tune40<-d1234(40)
+
+
+
+tuningchemo<-data.frame(rbind(tune1,tune2,tune3,tune4,tune5,tune6,tune7,tune10,tune12,tune15,tune20,tune25,tune30,tune35,tune40))
+
+tuningchemo$Neighbors<-c(rep(1,6),rep(2,6),rep(3,6),rep(4,6),rep(5,6),rep(6,6),rep(7,6),rep(10,6),rep(12,6),rep(15,6),rep(20,6),rep(25,6),rep(30,6),rep(35,6),rep(40,6))
+tuningchemo$Model<-"Chemotypes"
+
+```
+
+```{r outputting the nearest neighbors and their jaccard values,message=FALSE, warning=FALSE }
+
+#outputting the nearest neighbors and their jaccard values for plotting
+jhistvals<-function(x){
+g<-which(colnames(jaccard)==x)
+g2<-data.frame(jaccard[,g],rownames(jaccard))
+g2<-arrange(g2, desc(jaccard...g.))
+g3<-slice(g2, 1:12)
+mean(g3[,1])
+}
+
+histyj<-data.frame(sapply(colnames(jaccard), jhistvals))
+colnames(histyj)<-"Jaccard_Mean"
+```
+
+
+## Reading in EDSP universe chemotypes
+
+```{r,message=FALSE, warning=FALSE }
+#reading in new chemical data
+testchems<-read_excel(path = "Supp2_Inputdata_Foster_etal_HTH295R_QSAR.xlsx", sheet = 8)
+
+
+testchemsnames<-testchems$V1
+
+#getting data frame ready for modeling
+testchems<-testchems[,-1]
+testchems<-sapply(testchems, as.numeric)
+testchems<-data.frame(testchems)
+testchems$rownums<-1:nrow(testchems)
+testchems<-na.omit(testchems)
+testchems<-data.frame(testchems)
+testchems<-dplyr::select(testchems, -(which(colSums(testchems)==0)))
+rownames(testchems)<-testchemsnames[testchems$rownums]
+testchems<-testchems[,-639]
+
+colntc<-colnames(testchems)
+xx<-subset(colntc, !(colntc %in% colnames(operachemo)))
+operachemo[xx]<-0
+testchems<-testchems[,order(names(testchems))]
+operachemo<-operachemo[,order(names(operachemo))]
+
+```
+
+
+## Jaccard matrix for chemotype EDSP
+
+```{r getting jaccard matrix for new chems takes days in R, eval=F,message=FALSE, warning=FALSE }
+#similar to running jaccard matrix above but this time find all the jaccard similarities for new chemicals (6302) to the chemicals with assay data (1400)
+ji <- function(M,N, x,y){
+  sums = colSums(M[c(x),])+colSums(N[c(y),])
+
+  similarity = length(sums[sums==2])
+  total = length(sums[sums==1]) + similarity
+
+  similarity/total
+}
+
+ jaccardnew<-matrix(NA, ncol = nrow(testchems),nrow=nrow(operachemo))
+
+
+ for(i in 1:nrow(operachemo)){
+   for(k in 1:nrow(testchems)){
+     jaccardnew[i,k]<-ji(operachemo, testchems,i,k)
+  }
+
+}
+
+```
+
+
+```{r reading in edsp chemotype jaccard,message=FALSE, warning=FALSE }
+jpred<-read_excel(path = "Supp4_Nearest_Neighbor_Outputs.xlsx", sheet = 2)
+jpred<-data.frame(jpred)
+jpred<-jpred[,-1]
+colnames(jpred)<-rownames(testchems)
+rownames(jpred)<-operafull2dis$chnm
+jpred2<-na.omit(jpred)
+```
+
+
+## Generating EDSP chemotype predictions using 10 neighbor Jaccard model
+
+```{r getting EDSP chemotype predictions, eval=F,message=FALSE, warning=FALSE }
+
+#same modeling procedure above except with the EDSP chemicals as input
+
+prednew<-function(x){
+   g<-which(colnames(jpred2)==x)
+g2<-data.frame(jpred2[,g],rownames(jpred2))
+g2<-arrange(g2, desc(jpred2...g.))
+g3<-slice(g2, 1:12)
+g6<-subset(operafull2dis, chnm %in% g3$rownames.jpred2.)
+g3<-arrange(g3, rownames.jpred2.)
+g6<-arrange(g6, chnm)
+c(sum(g3$jpred2...g.*g6$status01)/sum(g3$jpred2...g.),mean(g3$jpred2...g.),max(g3$jpred2...g.))
+}
+
+
+jj<-sapply(colnames(jpred2), prednew)
+prededsp<-data.frame(t(jj))
+colnames(prededsp)<-c("Prediction","Jaccard_Mean","Jaccard_Max")
+
+prededsp$chnm<-colnames(jpred2)
+prededsp2<-subset(prededsp, chnm %in% testchemsnames)
+p2<-(subset(prededsp2, Prediction>.8|Prediction<.1))
+p2<-p2 %>% 
+  mutate(bin = case_when( Prediction>.8 ~1
+,Prediction<.1 ~0))
+
+```
+
+## Plotting the mean jaccard value of chemical groups used for prediction in chemotypes
+
+```{r,message=FALSE, warning=FALSE }
+epred<-read_excel(path = "Supp4_Nearest_Neighbor_Outputs.xlsx", sheet = 4)
+epred$Prediction<-as.numeric(epred$Prediction)
+epred2<-subset(epred, Prediction>.8|Prediction<.1)
+epred2<-subset(epred2, chnm %in% testchemsnames)
+
+
+densy1 <- ggplot(epred2, aes(x=Jaccard_Mean,linetype="EDSP"))+
+  geom_density(size=1) +labs(title="A",x="Jaccard Mean",y="Density",linetype="Line")+geom_vline(xintercept = .8, color="red")+geom_density(data=histyj, aes(linetype="HTH295R"),size=1)+theme_bw()+theme(axis.text=element_text(size=12), axis.title = element_text(size=15),title=element_text(size=17))+ylim(0,3.1)
+densy1
+
+```
+
+## Morgan Fingerprints
+
+```{r generating fingerprints and sim matrix,message=FALSE, warning=FALSE }
+
+#generating similarity matrix
+
+fpsJ<-data.frame(fp.sim.matrix(fps))
+
+colnames(fpsJ)<-rownames(operachemo)
+rownames(fpsJ)<-rownames(operachemo)
+
+#putting 0 on the diagonal
+for(i in 1:1400){
+  fpsJ[i,i]=0
+}
+fpsJ<-na.omit(fpsJ)
+
+```
+
+
+## Tuning the Morgan fingerprint model
+
+Running the Morgan model at 5,10,12,15,20,25,30,35,40 neighbors and intersections of .1,.2 lower, .7,.8,.9 upper cutoffs
+```{r tuning for the morgan model, eval=F,message=FALSE, warning=FALSE }
+#similar modeling procedure as above except with Morgan fingerprint descriptor set, changing number of neighbors
+try13<-function(r){
+nebMorgan<-function(x){
+g<-which(colnames(fpsJ)==x)
+g2<-data.frame(fpsJ[,g],rownames(fpsJ))
+g2<-arrange(g2, desc(fpsJ...g.))
+g3<-slice(g2, 1:r)
+g6<-subset(operafull2dis, chnm %in% g3$rownames.fpsJ.)
+g3<-arrange(g3, rownames.fpsJ.)
+g6<-arrange(g6, chnm)
+sum(g3$fpsJ...g.*g6$status01)/sum(g3$fpsJ...g.)
+}
+
+thr3<-function(z,y){
+xmorgan<-data.frame(sapply(colnames(fpsJ), nebMorgan))
+xmorgan$chnm<-colnames(fpsJ)
+xmorgan <- xmorgan %>% mutate(sapply.colnames.fpsJ...nebMorgan. = case_when(sapply.colnames.fpsJ...nebMorgan. > z ~1
+,sapply.colnames.fpsJ...nebMorgan. < y ~0))
+
+c<-confusionMatrix(as.factor(xmorgan$sapply.colnames.fpsJ...nebMorgan.), as.factor(operafull2dis$status01),positive="1")
+sens<-c$byClass[1]
+spef<-c$byClass[2]
+
+hh<-c(spef,sens,sum(c$table),mean(c(spef,sens)))
+
+hh
+}
+
+
+wow4<-mapply(thr3, c(.7,.8,.9), .2)
+wow4<-t(wow4)
+colnames(wow4)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+wow5<-mapply(thr3, c(.7,.8,.9), .1)
+wow5<-t(wow5)
+colnames(wow5)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+thrd<-data.frame(rbind(wow4,wow5))
+
+thrd$upper<-rep(c(.7,.8,.9),2)
+thrd$lower<-c(rep(.2,3),rep(.1,3))
+
+thrd
+
+} 
+
+tuneM1<-try13(1)
+tuneM2<-try13(2)
+tuneM3<-try13(3)
+tuneM4<-try13(4)
+tuneM5<-try13(5)
+tuneM7<-try13(7)
+tuneM10<-try13(10)
+tuneM12<-try13(12)
+tuneM15<-try13(15)
+tuneM20<-try13(20)
+tuneM25<-try13(25)
+tuneM30<-try13(30)
+tuneM35<-try13(35)
+tuneM40<-try13(40)
+
+
+tuningmorgan<-data.frame(rbind(tuneM1,tuneM2,tuneM3,tuneM4,tuneM5,tuneM7,tuneM10,tuneM12,tuneM15,tuneM20,tuneM25,tuneM30,tuneM35,tuneM40))
+
+tuningmorgan$Neighbors<-c(rep(1,6),rep(2,6),rep(3,6),rep(4,6),rep(5,6),rep(7,6),rep(10,6),rep(12,6),rep(15,6),rep(20,6),rep(25,6),rep(30,6),rep(35,6),rep(40,6))
+tuningmorgan$Model<-"Morgan"
+
+tuningRF<-data.frame(rbind(tuningchemo,tuningmorgan))
+
+```
+
+
+```{r outputting the nearest neighbors and their jaccard values morgan,message=FALSE, warning=FALSE }
+
+jhistvalsM<-function(x){
+g<-which(colnames(fpsJ)==x)
+g2<-data.frame(fpsJ[,g],rownames(fpsJ))
+g2<-arrange(g2, desc(fpsJ...g.))
+g3<-slice(g2, 1:12)
+mean(g3[,1])
+}
+
+histyjM<-data.frame(sapply(colnames(fpsJ), jhistvalsM))
+colnames(histyjM)<-"Jaccard_Mean"
+```
+
+
+
+## Morgan Fingerprint EDSP
+
+Running EDSP chemicals through the Morgan nearest neighbor model
+
+```{r generating fingerprints for new chems and running sim matrix,message=FALSE, warning=FALSE }
+
+
+testchemsnames<-setdiff(testchemsnames, rownames(operachemo))
+
+#getting smiles data for new chemicals
+tcs2<-rbind(tcs,smiles1)
+
+mols2 <- parse.smiles(tcs2$QSAR_READY_SMILES)
+fps2 <- lapply(mols2, get.fingerprint)
+
+#similarity matrix
+fpsJ2<-data.frame(fp.sim.matrix(fps2))
+
+
+colnames(fpsJ2)<-tcs2$INPUT
+rownames(fpsJ2)<-tcs2$INPUT
+for(i in 1:ncol(fpsJ2)){
+  fpsJ2[i,i]=0
+}
+
+
+fpsJ3 <- fpsJ2[rownames(fpsJ2) %in% operafull2dis$chnm, ] 
+
+```
+
+
+
+```{r getting predictions for edsp morgan,message=FALSE, warning=FALSE }
+prednewMorgan<-function(x){
+g<-which(colnames(fpsJ3)==x)
+g2<-data.frame(fpsJ3[,g],rownames(fpsJ3))
+g2<-arrange(g2, desc(fpsJ3...g.))
+g3<-slice(g2, 1:12)
+g6<-subset(operafull2dis, chnm %in% g3$rownames.fpsJ3.)
+g3<-arrange(g3, rownames.fpsJ3.)
+g6<-arrange(g6, chnm)
+c(sum(g3$fpsJ3...g.*g6$status01)/sum(g3$fpsJ3...g.),mean(g3$fpsJ3...g.),max(g3$fpsJ3...g.))
+}
+
+jjM<-sapply(colnames(fpsJ3), prednewMorgan)
+prededspMorgan<-data.frame(t(jjM))
+colnames(prededspMorgan)<-c("Prediction","Jaccard_Mean","Jaccard_Max")
+prededspMorgan$chnm<-rownames(prededspMorgan)
+epm<-prededspMorgan
+epm$Prediction<-as.numeric(epm$Prediction)
+```
+
+## Plotting the mean jaccard value of chemical groups used for prediction in Morgan fingerprints
+
+```{r data for prediction ploting mean jaccard similarity for each,message=FALSE, warning=FALSE }
+epm1<-subset(prededspMorgan, chnm %in% testchemsnames)
+epm1<-subset(epm1, Prediction>.7 | Prediction <.1)
+
+densy2 <- ggplot(epm1, aes(x=Jaccard_Mean, linetype="EDSP"))+
+  geom_density(size=1) +labs(title = "B",x="Jaccard Mean",y="Density",linetype="Line")+geom_vline(xintercept = .8, color="red")+geom_density(data=histyjM,aes(linetype="HTH295R"),size=1)+theme_bw()+theme(axis.text=element_text(size=12), axis.title = element_text(size=15),title=element_text(size=17))+ylim(0,3)
+densy2
+```
+
+
+## Combined density plots
+
+```{r,message=FALSE, warning=FALSE }
+grid_arrange_shared_legend(densy1,densy2)
+```
+
+
+# EDSP chemical predictions {.tabset .tabset-fade .tabset-pills}
+
+## Joining Chemotype and Morgan predictions
+```{r,message=FALSE, warning=FALSE }
+#epred is chemotype and prededspMorgan is Morgan fingerprint, both edsp predictions joined by chemical name
+edsp_data<-left_join(epred, prededspMorgan, by="chnm")
+edsp_data<-edsp_data[,-c(3,4,6,7)]
+
+edsp_data<- edsp_data %>% mutate(Prediction.x = case_when(Prediction.x >.8 ~"Positive"
+,Prediction.x <.1 ~"Negative",
+TRUE ~"Equivocal"))
+
+
+
+edsp_data<- edsp_data %>% mutate(Prediction.y = case_when(Prediction.y >.7 ~"Positive"
+,Prediction.y <.1 ~"Negative",
+TRUE ~"Equivocal"))
+
+
+```
+
+
+
+```{r chemical data frame of predictions,message=FALSE, warning=FALSE }
+
+#Making sure we have the correct 7702 chemical names
+#otc is edsp chemicals and testchems is the 1400 test chemicals
+opera_edsp<-cbind(otc, testchems)
+opera_edsp$PREFERRED_NAME<-rownames(opera_edsp)
+opera_edsp<-subset(opera_edsp,PREFERRED_NAME %in% testchemsnames)
+
+opera_edsp_names<-opera_edsp$PREFERRED_NAME
+opera_edsp<-opera_edsp[,-c(1:4)]
+opera_edsp[,1:13]<-data.frame(sapply(opera_edsp[,1:13], as.numeric))
+rownames(opera_edsp)<-opera_edsp_names
+
+#adding rf testing set predictions
+rf.opera <- randomForest(statusNP~OCTANOL_WATER_PARTITION_LOGP_OPERA_PRED+AVERAGE_MASS+ATMOSPHERIC_HYDROXYLATION_RATE_.AOH._CM3.MOLECULE.SEC_OPERA_PRED+BIOCONCENTRATION_FACTOR_OPERA_PRED  +BIODEGRADATION_HALF_LIFE_DAYS_DAYS_OPERA_PRED+
+BOILING_POINT_DEGC_OPERA_PRED+HENRYS_LAW_ATM.M3.MOLE_OPERA_PRED+OPERA_KM_DAYS_OPERA_PRED+OCTANOL_AIR_PARTITION_COEFF_LOGKOA_OPERA_PRED+SOIL_ADSORPTION_COEFFICIENT_KOC_L.KG_OPERA_PRED+MELTING_POINT_DEGC_OPERA_PRED+VAPOR_PRESSURE_MMHG_OPERA_PRED+WATER_SOLUBILITY_MOL.L_OPERA_PRED, data=operafull2dis, mtry=4,ntree=500, importance=T, na.action = na.omit)
+
+
+predrf<-predict(rf.opera, opera_edsp)
+predrf<-data.frame(predrf)
+predrf$chnm<-opera_edsp_names
+
+ht_predrf<-data.frame(rf.opera$predicted)
+ht_predrf$chnm<-operafull2dis$chnm
+colnames(predrf)<-c("Predicted", "chnm")
+colnames(ht_predrf)<-c("Predicted", "chnm")
+predrf2<-rbind(predrf, ht_predrf)
+
+
+
+edsp_data<-left_join(edsp_data, predrf2, by="chnm")
+```
+
+
+
+```{r computing the scores for model agreement}
+
+edsp_data2<-edsp_data
+colnames(edsp_data2)<-c("Chemical","Chemotype_Model","Morgan_Model","OPERA_RF")
+
+
+#creating a new column that takes the pos/neg/eq outcomes and assigns them a score
+edsp_data2<-edsp_data2 %>% mutate(Chemotype_Score = case_when(Chemotype_Model=="Positive"~1,
+                                Chemotype_Model=="Negative"~0,
+                                Chemotype_Model=="Equivocal"~.5))
+#doing this for each model
+edsp_data2<-edsp_data2 %>% mutate(Morgan_Score = case_when(Morgan_Model=="Positive"~1,
+                                Morgan_Model=="Negative"~0,
+                                Morgan_Model=="Equivocal"~.5))
+#rf is less because we have less confidence in the model
+edsp_data2<-edsp_data2 %>% mutate(Random_Forest = case_when(OPERA_RF=="positive"~.75,
+                                OPERA_RF=="negative"~0,
+                                is.na(OPERA_RF)~.25))
+#adding up scores to create the new variable of model agreement
+edsp_data2$Model_Agreement<-as.character(edsp_data2$Chemotype_Score+edsp_data2$Morgan_Score+edsp_data2$Random_Forest)
+```
+
+
+
+#How many unique chemicals in the 6302 edsp chemicals perturb estrogen/androgen according to our prelimiary structure alert?
+```{r}
+#outcomes is the result of the above code where we create the summary data frame
+
+outcomes<-read_excel(path = "Supp5_ModelAgreement.xlsx", sheet = 1)
+
+outcomes6302<-subset(outcomes, Actual!="negative" & Actual!="positive")
+nn1<-outcomes6302[which(outcomes[,15]==1),]$Chemical
+nn2<-outcomes6302[which(outcomes[,16]==1),]$Chemical
+nn3<-outcomes6302[which(outcomes[,17]==1),]$Chemical
+nn4<-outcomes6302[which(outcomes[,18]==1),]$Chemical
+
+uniqueN(c(nn1,nn2,nn3,nn4))
+
+```
+
+## How do the model agreement scores compare in chemicals with assay data?
+
+
+```{r}
+
+
+#subsetting outcomes by actual pos/neg we know these chemicals were tested in the assay 
+htdata<-subset(outcomes, Actual=="positive"|Actual=="negative")
+htdata$Model_Agreement<-as.numeric(htdata$Model_Agreement)
+
+
+ma_cut<-function(cutoff){
+  #new prediction variable if model agreement is over a cutoff we determine
+ htdata <- htdata %>% mutate(new_prediction = case_when(Model_Agreement>cutoff~"positive",
+Model_Agreement<=cutoff~"negative"))
+ 
+
+#comparing outcomes by building a 2x2 table and computing sens/spef
+cm<-confusionMatrix(as.factor(htdata$new_prediction), as.factor(htdata$Actual), positive = "positive")
+Sensitivity<-cm$byClass[1]
+Specificity<-cm$byClass[2]
+Accuracy<-(Sensitivity+Specificity)/2
+Kappa<-cm$overall[2]
+c(Sensitivity,Specificity,Accuracy,Kappa)
+}
+
+#binarizing the model agreement scores
+ma_test<-data.frame(rbind(ma_cut(.75),ma_cut(1),ma_cut(1.25),ma_cut(1.5),ma_cut(1.75)))
+colnames(ma_test)<-c("Sensitivity","Specificity","Accuracy","Kappa")
+ma_test$Model_Agreement<-c(.75,1,1.25,1.5,1.75)
+ma_test<-ma_test[,c(5,1,2,3,4)]
+colnames(ma_test)[1]<-"Model Agreement "
+ma_test<-round(ma_test, 4)
+
+ma_test_table<-tableGrob(ma_test, rows=NULL)
+ma_test_table <- gtable_add_grob(ma_test_table,
+        grobs = rectGrob(gp = gpar(fill = NA, lwd = 0)),
+        t = 2, b = nrow(ma_test_table), l = 1, r = ncol(ma_test_table))
+
+```
+
+
+
+
+## Computing sensitivity and specificity for chemicals that are equivocal in NN
+
+```{r}
+#subsetting equivocal data 
+EQ_htdata<-subset(outcomes, Chemotype_Score==.5 & Morgan_Score==.5)
+#subsetting chemicals with assay data, the only chemicals we can compute sens/spef on
+EQ_htdata<-subset(EQ_htdata, Actual=="positive"|Actual=="negative")
+
+#use .75 as cutoff, can change it readily 
+EQ_htdata <- EQ_htdata %>% mutate(new_prediction = case_when(Random_Forest
+==0.75~"positive",
+Random_Forest==0~"negative"))
+
+EQcm<-confusionMatrix(as.factor(EQ_htdata$new_prediction), as.factor(EQ_htdata$Actual), positive = "positive")
+
+EQcm
+```
+
+
+
+
+## Computing proportion of positives across the model agreement categories
+```{r}
+score_props<-data.frame(table(htdata$Model_Agreement,htdata$Actual ))
+colnames(score_props)<-c("MA","Status","Count")
+score_props
+
+MA_prop<-function(x){
+  prop<-score_props[which(score_props$MA==x&score_props$Status=="positive"),3]/(score_props[which(score_props$MA==x&score_props$Status=="positive"),3]+score_props[which(score_props$MA==x&score_props$Status=="negative"),3])
+  prop
+}
+
+MA_ss<-function(x){
+  ss<-(score_props[which(score_props$MA==x&score_props$Status=="positive"),3]+score_props[which(score_props$MA==x&score_props$Status=="negative"),3])
+  ss
+}
+
+propy<-unlist(sapply(c(0,.5,.75,1,1.25,1.5,1.75,2,2.25,2.75), MA_prop))
+
+
+
+MAs<-c(0,.5,.75,1,1.25,1.5,1.75,2,2.25,2.75)
+
+sample_sizes_p<-unlist(sapply(c(0,.5,.75,1,1.25,1.5,1.75,2,2.25,2.75), MA_ss))
+
+score_props_t<-data.frame(cbind(propy, MAs, sample_sizes_p))
+
+colnames(score_props_t)<-c("Proportion","Model Agreement","Sample Size")
+
+score_props_t<-round(score_props_t, 2)
+score_props_t<-arrange(score_props_t, desc(`Model Agreement`))
+
+score_props_t<-(score_props_t[,c(2,1,3)])
+
+score_props_table<-tableGrob(score_props_t, rows=NULL)
+score_props_table <- gtable_add_grob(score_props_table,
+        grobs = rectGrob(gp = gpar(fill = NA, lwd = 0)),
+        t = 2, b = nrow(score_props_table), l = 1, r = ncol(score_props_table))
+```
+
+
+## Distribution of model agreement categories in EDSP Predictions
+
+0 is the lowest model agreement score while 2.75 is the highest. All models have a score of 0 for a negative outcome. The RF model has 0.25 for an equivocal outcome and 0.75 for a positive one. The nearest neighbor models have 0.5 for an equivocal outcome and 1 for a positive one.
+
+```{r model agreement figure}
+#not including those chemicals with assay data
+data4<-subset(outcomes, Actual!="negative"& Actual!="positive")
+
+modA_fig<-ggplot(data4, aes(x=as.factor(Model_Agreement), fill=as.factor(Model_Agreement)))+geom_bar()+geom_text(stat='count', aes(label=..count..), vjust=-1)+theme_bw()+labs(fill="Model Agreement",x="Model Agreement",y="Count", title = "A")+theme(text=element_text(size=15))+ylim(0,3050)
+
+modA_fig
+```
+
+
+## Model agreement figure and table combo
+
+```{r, fig.show='hide'}
+
+top_row<-grid.arrange(ma_test_table, score_props_table, ncol=2)
+bottom_row <- grid.arrange(nullGrob(), modA_fig, nullGrob(), ncol = 3, widths = c(1,6,1))
+
+```
+
+```{r fig.height=11, fig.width=10}
+ ma_plot_combo <- grid.arrange(bottom_row, top_row, ncol = 1)
+ grid.draw(ma_plot_combo)
+
+```
+
+# Classyfire {.tabset .tabset-fade .tabset-pills}
+
+```{r Classyfire data}
+dtxsidclassyfire<-subset(dtxsidclassyfire, DTXSID %in% classyfire$dtxsid)
+classyfire<-arrange(classyfire, dtxsid)
+dtxsidclassyfire<-arrange(dtxsidclassyfire,DTXSID)
+classyfire$chnm<-dtxsidclassyfire$PREFERRED_NAME
+```
+
+
+## Classyfire dotplots
+
+Looking at the distribution of chemical class in the 1400 training chemicals
+
+```{r classyfire hth295r}
+
+epred3<-subset(epred, !(chnm %in% testchemsnames))
+classe<-subset(classyfire, chnm %in% epred3$chnm)
+classe2<-subset(epred3, chnm %in% classe$chnm)
+classe<-arrange(classe, chnm)
+classe2<-arrange(classe2, chnm)
+
+classe3<-cbind(classe[,c(4:6,8)],classe2$Prediction)
+colnames(classe3)[5]<-"Values"
+
+classe3 <- classe3 %>% mutate(Prediction = case_when(Values >.8~"Positive"
+,Values<.1~"Negative"))
+
+classe3 <- classe3 %>% mutate(Prediction = replace_na(Prediction, "Equivocal"))
+
+#filtering by classes that have at least 30 chemicals for the sake of room
+classe4<-classe3 %>%
+  group_by(class) %>%
+  filter(n() > 20)
+classe4<-na.omit(classe4)
+
+class5<-ggplot(classe4, aes(x=Values,y=class,color=as.factor(Prediction),shape=as.factor(Prediction)))+geom_count()+ scale_size(guide = 'none')+labs(y="Class",color="Prediction",shape="Prediction",x="Predicted Value",title="A")+theme_bw()+scale_colour_brewer(palette="Dark2")+theme(axis.title = element_text(size = 19),title = element_text(size = 16),legend.text=element_text(size=15), axis.text.x = element_text(size=13),axis.text.y = element_text(size=13))
+
+class5
+```
+
+```{r morgan hth295r}
+
+epm3<-subset(epm, !(chnm %in% testchemsnames))
+classeM<-subset(classyfire, chnm %in% epm3$chnm)
+classeM2<-subset(epm3, chnm %in% classeM$chnm)
+classeM<-arrange(classeM, chnm)
+classeM2<-arrange(classeM2, chnm)
+
+classeM3<-cbind(classeM[,c(4:6,8)],classeM2$Prediction)
+colnames(classeM3)[5]<-"Values"
+
+classeM3 <- classeM3 %>% mutate(Prediction = case_when(Values >.7~"Positive"
+,Values<.1~"Negative"))
+
+classeM3 <- classeM3 %>% mutate(Prediction = replace_na(Prediction, "Equivocal"))
+
+classeM4<-classeM3 %>%
+  group_by(class) %>%
+  filter(n() > 20)
+classeM4<-na.omit(classeM4)
+
+class6<-ggplot(classeM4, aes(x=Values,y=class,color=as.factor(Prediction),shape=as.factor(Prediction)))+geom_count()+scale_size(guide = 'none')+labs(y="Class",color="Prediction",shape="Prediction",x="Predicted Value",title="B")+theme_bw()+scale_colour_brewer(palette="Dark2")+theme(axis.title = element_text(size = 19),title = element_text(size = 16),legend.text=element_text(size=15), axis.text.x = element_text(size=13),axis.text.y = element_text(size=13))
+
+class6
+```
+
+```{r, fig.height=10,fig.width=8, fig.show='hide', message=FALSE}
+#combined figure of two edsp classyfire plots 
+ classcomboHT<-grid.arrange(class5,class6)
+```
+
+Looking at the distribution of chemical class in the EDSP chemicals
+
+```{r classyfire edsp}
+#reminder that epred is the edsp prediction for chemotype NN models
+#Here we are plotting those predictions using the classyfire designations
+epred2<-subset(epred, chnm %in% testchemsnames)
+classe<-subset(classyfire, chnm %in% epred2$chnm)
+classe2<-subset(epred2, chnm %in% classe$chnm)
+classe<-arrange(classe, chnm)
+classe2<-arrange(classe2, chnm)
+
+classe3<-cbind(classe[,c(4:6,8)],classe2$Prediction)
+colnames(classe3)[5]<-"Values"
+
+classe3 <- classe3 %>% mutate(Prediction = case_when(Values >.8~"Positive"
+,Values<.1~"Negative"))
+
+classe3 <- classe3 %>% mutate(Prediction = replace_na(Prediction, "Equivocal"))
+
+#filtering by classes that have at least 30 chemicals for the sake of room
+classe4<-classe3 %>%
+  group_by(class) %>%
+  filter(n() > 30)
+classe4<-na.omit(classe4)
+
+class3<-ggplot(classe4, aes(x=Values,y=class,color=as.factor(Prediction),shape=as.factor(Prediction)))+geom_count()+scale_size(guide = 'none')+labs(y="Class",color="Prediction",shape="Prediction",x="Predicted Value",title="C")+theme_bw()+scale_colour_brewer(palette="Dark2")+theme(axis.title = element_text(size = 19),title = element_text(size = 16),legend.text=element_text(size=15), axis.text.x = element_text(size=13),axis.text.y = element_text(size=13))
+
+class3
+```
+
+
+```{r}
+#epm is the edsp predictions using the Morgan fingerprint NN models. Repeating the same procedure 
+epm2<-subset(epm, chnm %in% testchemsnames)
+classeM<-subset(classyfire, chnm %in% epm2$chnm)
+classeM2<-subset(epm2, chnm %in% classeM$chnm)
+classeM<-arrange(classeM, chnm)
+classeM2<-arrange(classeM2, chnm)
+
+classeM3<-cbind(classeM[,c(4:6,8)],classeM2$Prediction)
+colnames(classeM3)[5]<-"Values"
+
+classeM3 <- classeM3 %>% mutate(Prediction = case_when(Values >.7~"Positive"
+,Values<.1~"Negative"))
+
+classeM3 <- classeM3 %>% mutate(Prediction = replace_na(Prediction, "Equivocal"))
+
+classeM4<-classeM3 %>%
+  group_by(class) %>%
+  filter(n() > 30)
+classeM4<-na.omit(classeM4)
+
+class4<-ggplot(classeM4, aes(x=Values,y=class,color=as.factor(Prediction),shape=as.factor(Prediction)))+geom_count()+scale_size(guide = 'none')+labs(y="Class",color="Prediction",shape="Prediction",x="Predicted Value",title="D")+theme_bw()+scale_colour_brewer(palette="Dark2")+theme(axis.title = element_text(size = 19),title = element_text(size = 16),legend.text=element_text(size=15), axis.text.x = element_text(size=13),axis.text.y = element_text(size=13))
+
+class4
+```
+
+```{r, fig.height=10,fig.width=8,fig.show='hide', message=FALSE}
+#combined figure of two edsp classyfire plots 
+ classcomboEDSP<-grid_arrange_shared_legend(class3,class4)
+```
+
+
+
+
+## Classyfire for chemicals only present in RF models
+
+```{r fig.height=10, fig.width=8}
+RFchems<-subset(outcomes, Chemotype_Score==0.5 & Morgan_Score==0.5)$Chemical
+
+RF_class<-subset(classe, chnm %in% RFchems)
+RF_bioactivity<-subset(edsp_data2, Chemical %in% RF_class$chnm)
+
+
+RF_class<-arrange(RF_class, chnm)
+RF_bioactivity<-arrange(RF_bioactivity, Chemical)
+RF_class$Outcome<-RF_bioactivity$OPERA_RF
+RF_class<-na.omit(RF_class)
+
+RF_class2<-RF_class %>%
+  group_by(class) %>%
+  filter(n() > 9)
+
+ss<-RF_class2 %>%
+  group_by(class) %>%
+ tally()
+
+RF_class3<-left_join(RF_class2, ss, by="class")
+
+RF_class3$class2<-paste(RF_class3$class, RF_class3$n, sep=":")
+RF_class3<-arrange(RF_class3,desc(n))
+
+rfcp<-ggplot(RF_class3, (aes(x=reorder(class2,n), fill=Outcome, y=n)))+ 
+    geom_bar(position="fill", stat="identity")+
+  coord_flip()+labs(x="Class",y="Proportion",title="Chemical Class in Random Forest Only Chemicals")+theme_bw()+scale_fill_brewer(palette="Dark2")+theme(axis.title = element_text(size = 19),title = element_text(size = 19),legend.text=element_text(size=16), axis.text.x = element_text(size=15),axis.text.y = element_text(size=12))
+
+rfcp
+```
+
+
+
+# Venn Diagram {.tabset .tabset-fade .tabset-pills}
+
+## Nearest Neighbor Models
+
+Looking at the intersection of EDSP prediction chemicals in the chemotype and Morgan models
+
+
+```{r message=FALSE, warning=FALSE}
+#subsetting using the designated cutoffs for chemotypes
+epred3pos<-subset(epred3, Prediction>.8)
+epred3neg<-subset(epred3, Prediction<.1)
+
+#subsetting using the designated cutoffs for Morgan fingerprints
+epm3pos<-subset(epm3, Prediction>.7)
+epm3neg<-subset(epm3, Prediction<.1)
+
+
+x2 <- list(Mpos=epm3pos$chnm,Cpos=epred3pos$chnm,Mneg=epm3neg$chnm,Cneg=epred3neg$chnm)
+ven2<-ggvenn(x2, 
+  fill_color = c("#3d0965", "#fcac11", "#bc3754", "#e45a31"),
+ stroke_size = 0.5, set_name_size = 10, show_percentage = F, text_size = 7)+labs(title="A")+xlim(-3,3)+theme_void(base_size = 20)
+
+ven2
+
+```
+
+```{r message=FALSE, warning=FALSE}
+epred2pos<-subset(epred2, Prediction>.8)
+epred2neg<-subset(epred2, Prediction<.1)
+
+epm2pos<-subset(epm2, Prediction>.7)
+epm2neg<-subset(epm2, Prediction<.1)
+
+
+x1 <- list(Mpos=epm2pos$chnm,Cpos=epred2pos$chnm,Mneg=epm2neg$chnm,Cneg=epred2neg$chnm)
+
+ven1<-ggvenn(x1, 
+  fill_color = c("#3d0965", "#fcac11", "#bc3754", "#e45a31"),
+  stroke_size = 0.5, set_name_size = 10, show_percentage = F, text_size = 7)+labs(title="B")+xlim(-3,3)+theme_void(base_size = 20)
+
+ven1
+```
+
+
+# Line plots for nearest neighbor model tuning {.tabset .tabset-fade .tabset-pills}
+
+Seeing how sensitivity, specificity, and number of chemicals, change with model type, cut off values, and number of neighbors
+
+```{r, fig.height=6, fig.width=10, message=FALSE, warning=FALSE}
+NNMod<-read_excel(path = "Supp4_Nearest_Neighbor_Outputs.xlsx", sheet = 3)
+NNMod<-NNMod[,-1]
+
+NNModM<-melt(NNMod, id.vars=c("Number.of.Chemicals","Balanced.Accuracy" ,"upper","lower","Neighbors","Model"))
+
+NNModM$Threshold<-paste(NNModM$upper,NNModM$lower,sep=",")
+
+lineplot<-ggplot(data=NNModM, aes(x=Neighbors, y=value,color=variable,size=Number.of.Chemicals, shape=variable))+geom_point()+labs(color="Rate",y="Rate",x="Number of Neighbors",size="Number of Chemicals",shape="Rate")+
+  facet_grid(Model~Threshold)+
+  theme_bw()+scale_size_continuous(breaks=c(100,200,300,400,500,600),range = c(1, 6),labels=c("100","200","300","400","500","600"))+theme(axis.title = element_text(size = 20),title = element_text(size = 18),legend.text=element_text(size=15),strip.text = element_text(size = 15), axis.text = element_text(size=15))+scale_x_continuous(breaks=c(1,10,20,30,40))
+
+lineplot
+```
+
+
+# Estrogen and Androgen models {.tabset .tabset-fade .tabset-pills}
+
+
+# Estrogen chemotype NN models {.tabset .tabset-fade .tabset-pills}
+
+Before we just investigated whether there was either a fold change up or down and did not distinguish the direction of the change. Now we are looking at change up and change down separately. 
+
+## Reading in the estrogen data and splitting the variables for change up and down
+
+
+```{r}
+estrogen<-read_excel(path = "Supp2_Inputdata_Foster_etal_HTH295R_QSAR.xlsx", sheet = 7)
+
+
+
+#chemical is considered to have a change in estrogen activity if it has at least a 1.5 estrogen change in either estrogen hormone.
+estrogen<-estrogen %>% 
+  mutate(change = case_when( E1>.584|E2>.584|E1< -.584|E2< -.584~1))
+estrogen<-estrogen %>% mutate(change = replace_na(change, 0))
+
+estrogen<-estrogen %>% 
+  mutate(change_up = case_when( E1>.584|E2>.584~1))
+estrogen<-estrogen %>% mutate(change_up = replace_na(change_up, 0))
+
+estrogen<-estrogen %>% 
+  mutate(change_down = case_when( E1< -.584|E2< -.584~1))
+estrogen<-estrogen %>% mutate(change_down = replace_na(change_down, 0))
+
+
+#a chemical is deemed positive if it has a change at any concentration
+poschemys<-(unique(subset(estrogen, change==1)$dsstox_substance_id))
+estrogen<-estrogen %>% mutate(change = case_when(dsstox_substance_id %in% poschemys~1))
+estrogen<-estrogen %>% mutate(change = replace_na(change, 0)) 
+
+upchemys<-(unique(subset(estrogen, change_up==1)$dsstox_substance_id))
+estrogen<-estrogen %>% mutate(change_up = case_when(dsstox_substance_id %in% upchemys~1))
+estrogen<-estrogen %>% mutate(change_up = replace_na(change_up, 0)) 
+
+downchemys<-(unique(subset(estrogen, change_down==1)$dsstox_substance_id))
+estrogen<-estrogen %>% mutate(change_down = case_when(dsstox_substance_id %in% downchemys~1))
+estrogen<-estrogen %>% mutate(change_down = replace_na(change_down, 0)) 
+
+estrogen<-estrogen[,c(1,2,24:26)]
+estrogen<-distinct(estrogen)
+
+table(estrogen$change_up)
+table(estrogen$change_down)
+```
+
+
+
+
+## Reading in the saved jaccard matrix
+
+```{r jaccard estrogen, message=F, warning=F}
+jaccardchemo_estrogen <- read_excel(path =  "Supp8_Estrogens_Androgens_Data.xlsx", sheet = 1)
+
+jaccardchemo_estrogen<-jaccardchemo_estrogen[,-1]
+
+estrogens_toxprints<-read_excel(path =  "Supp8_Estrogens_Androgens_Data.xlsx", sheet = 2)
+
+estrogens_toxprints[estrogens_toxprints== "-"] <- NA
+estrogens_toxprints<-na.omit(estrogens_toxprints)
+#"DTXSID0032493 is in there twice will be deleted
+
+jaccardchemo_estrogen<-jaccardchemo_estrogen[,-611]
+jaccardchemo_estrogen<-jaccardchemo_estrogen[-611,]
+
+colnames(jaccardchemo_estrogen)<-estrogens_toxprints$DTXSID[-611]
+rownames(jaccardchemo_estrogen)<-estrogens_toxprints$DTXSID[-611]
+
+
+
+estrogen<-subset(estrogen, dsstox_substance_id %in% colnames(jaccardchemo_estrogen))
+estrogen<-estrogen[-611,]
+```
+
+The pos/negative split of up is `r table(estrogen$change_up)` and down is `r table(estrogen$change_up)`
+
+## Tuning chemotypes estrogen down
+
+```{r changing cut off values estrogen down, eval=F}
+d1234_es_down<-function(k){
+
+nebJ_estrogen_down<-function(x){
+g<-which(colnames(jaccardchemo_estrogen)==x)
+g2<-data.frame(jaccardchemo_estrogen[,g],rownames(jaccardchemo_estrogen))
+colnames(g2)<-c("x1","x2")
+g2<-arrange(g2, desc(x1))
+g3<-slice(g2, 1:k)
+g6<-subset(estrogen, dsstox_substance_id %in% g3$x2)
+g3<-arrange(g3, x2)
+g6<-arrange(g6, dsstox_substance_id)
+sum(g3$x1*g6$change_down)/sum(g3$x1)
+}  
+  
+
+thr3<-function(z,y){
+
+  estrogen_down_pred<-data.frame(sapply(estrogen$dsstox_substance_id, nebJ_estrogen_down))
+estrogen_down_pred$ID<-estrogen$dsstox_substance_id
+
+colnames(estrogen_down_pred)<-c("Prediction","ID")
+
+
+#setting the threshold for positive/negative outcomes 
+estrogen_down_pred <- estrogen_down_pred %>%
+  mutate(Prediction = case_when(Prediction > z ~1
+,Prediction < y ~0))
+
+
+#confusion matrix
+c<-confusionMatrix(as.factor(estrogen_down_pred$Prediction), as.factor(estrogen$change_down),positive="1")
+
+#sensitivity and specificity
+sens<-c$byClass[1]
+spef<-c$byClass[2]
+  
+
+hh<-c(spef,sens,sum(c$table),mean(c(spef,sens)))
+
+hh
+}
+
+
+wow4<-mapply(thr3, c(.5,.6,.7,.8,.9), .2)
+wow4<-t(wow4)
+colnames(wow4)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+wow5<-mapply(thr3, c(.5,.6,.7,.8,.9), .1)
+wow5<-t(wow5)
+colnames(wow5)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+thrd<-data.frame(rbind(wow4,wow5))
+
+thrd$upper<-rep(c(.5,.6,.7,.8,.9),2)
+thrd$lower<-c(rep(.2,5),rep(.1,5))
+
+thrd
+
+}
+
+tune1_es_down<-d1234_es_down(1)
+tune2_es_down<-d1234_es_down(2)
+tune3_es_down<-d1234_es_down(3)
+tune5_es_down<-d1234_es_down(5)
+tune7_es_down<-d1234_es_down(7)
+tune10_es_down<-d1234_es_down(10)
+
+
+
+tuning_estrogen_down<-data.frame(rbind(tune1_es_down,tune2_es_down,tune3_es_down,tune5_es_down,tune7_es_down,tune10_es_down))
+
+tuning_estrogen_down$Neighbors<-c(rep(1,10),rep(2,10),rep(3,10),rep(5,10),rep(7,10),rep(10,10))
+tuning_estrogen_down$Model<-"Chemotypes_E_Down"
+
+arrange(tuning_estrogen_down, desc(Balanced.Accuracy))
+
+
+```
+
+
+
+## Tuning chemotypes estrogen up
+
+```{r changing cut off values estrogen up, eval=F}
+d1234_es_up<-function(k){
+
+nebJ_estrogen_up<-function(x){
+g<-which(colnames(jaccardchemo_estrogen)==x)
+g2<-data.frame(jaccardchemo_estrogen[,g],rownames(jaccardchemo_estrogen))
+colnames(g2)<-c("x1","x2")
+g2<-arrange(g2, desc(x1))
+g3<-slice(g2, 1:k)
+g6<-subset(estrogen, dsstox_substance_id %in% g3$x2)
+g3<-arrange(g3, x2)
+g6<-arrange(g6, dsstox_substance_id)
+sum(g3$x1*g6$change_up)/sum(g3$x1)
+}  
+  
+
+thr3<-function(z,y){
+
+  estrogen_up_pred<-data.frame(sapply(estrogen$dsstox_substance_id, nebJ_estrogen_up))
+estrogen_up_pred$ID<-estrogen$dsstox_substance_id
+
+colnames(estrogen_up_pred)<-c("Prediction","ID")
+
+
+#setting the threshold for positive/negative outcomes 
+estrogen_up_pred <- estrogen_up_pred %>%
+  mutate(Prediction = case_when(Prediction > z ~1
+,Prediction < y ~0))
+
+
+#confusion matrix
+c<-confusionMatrix(as.factor(estrogen_up_pred$Prediction), as.factor(estrogen$change_up),positive="1")
+
+#sensitivity and specificity
+sens<-c$byClass[1]
+spef<-c$byClass[2]
+  
+
+hh<-c(spef,sens,sum(c$table),mean(c(spef,sens)))
+
+hh
+}
+
+
+wow4<-mapply(thr3, c(.5,.6,.7,.8,.9), .2)
+wow4<-t(wow4)
+colnames(wow4)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+wow5<-mapply(thr3, c(.5,.6,.7,.8,.9), .1)
+wow5<-t(wow5)
+colnames(wow5)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+thrd<-data.frame(rbind(wow4,wow5))
+
+thrd$upper<-rep(c(.5,.6,.7,.8,.9),2)
+thrd$lower<-c(rep(.2,5),rep(.1,5))
+
+thrd
+
+}
+
+tune1_es_up<-d1234_es_up(1)
+tune2_es_up<-d1234_es_up(2)
+tune3_es_up<-d1234_es_up(3)
+tune5_es_up<-d1234_es_up(5)
+tune7_es_up<-d1234_es_up(7)
+tune10_es_up<-d1234_es_up(10)
+
+
+
+tuning_estrogen_up<-data.frame(rbind(tune1_es_up,tune2_es_up,tune3_es_up,tune5_es_up,tune7_es_up,tune10_es_up))
+
+tuning_estrogen_up$Neighbors<-c(rep(1,10),rep(2,10),rep(3,10),rep(5,10),rep(7,10),rep(10,10))
+tuning_estrogen_up$Model<-"Chemotypes_E_Up"
+tuning_estrogen_up
+```
+
+
+
+# Androgens chemotype NN models {.tabset .tabset-fade .tabset-pills}
+
+## Androgen data import and variable creation
+
+Estrogen and androgen chemicals are the same so we can use the same jaccard matrix
+```{r}
+androgen<-read_excel(path = "Supp2_Inputdata_Foster_etal_HTH295R_QSAR.xlsx", sheet = 7)
+
+
+#chemical is considered to have a change in androgen activity if it has at least a 1.5 change in either androgen hormone.
+androgen<-androgen %>% 
+  mutate(change = case_when( ANDR>.584|TESTO>.584|ANDR< -.584|TESTO< -.584~1))
+androgen<-androgen %>% mutate(change = replace_na(change, 0))
+
+androgen<-androgen %>% 
+  mutate(change_up = case_when( ANDR>.584|TESTO>.584~1))
+androgen<-androgen %>% mutate(change_up = replace_na(change_up, 0))
+
+androgen<-androgen %>% 
+  mutate(change_down = case_when( ANDR< -.584|TESTO< -.584~1))
+androgen<-androgen %>% mutate(change_down = replace_na(change_down, 0))
+
+
+#a chemical is deemed positive if it has a change at any concentration
+poschemys2<-(unique(subset(androgen, change==1)$dsstox_substance_id))
+androgen<-androgen %>% mutate(change = case_when(dsstox_substance_id %in% poschemys2~1))
+androgen<-androgen %>% mutate(change = replace_na(change, 0)) 
+
+upchemys2<-(unique(subset(androgen, change_up==1)$dsstox_substance_id))
+androgen<-androgen %>% mutate(change_up = case_when(dsstox_substance_id %in% upchemys2~1))
+androgen<-androgen %>% mutate(change_up = replace_na(change_up, 0)) 
+
+downchemys2<-(unique(subset(androgen, change_down==1)$dsstox_substance_id))
+androgen<-androgen %>% mutate(change_down = case_when(dsstox_substance_id %in% downchemys2~1))
+androgen<-androgen %>% mutate(change_down = replace_na(change_down, 0)) 
+
+androgen<-androgen[,c(1,2,24:26)]
+androgen<-distinct(androgen)
+
+androgen<-subset(androgen, dsstox_substance_id %in% colnames(jaccardchemo_estrogen))
+androgen<-androgen
+
+table(androgen$change_up)
+table(androgen$change_down)
+```
+
+The pos/negative split of up is `r table(androgen$change_up)` and down is `r table(androgen$change_down)`
+
+
+## Tuning chemotype androgen down
+
+```{r changing cut off values androgen down, eval=F}
+d1234_an_down<-function(k){
+
+nebJ_androgen_down<-function(x){
+g<-which(colnames(jaccardchemo_estrogen)==x)
+g2<-data.frame(jaccardchemo_estrogen[,g],rownames(jaccardchemo_estrogen))
+colnames(g2)<-c("x1","x2")
+g2<-arrange(g2, desc(x1))
+g3<-slice(g2, 1:k)
+g6<-subset(androgen, dsstox_substance_id %in% g3$x2)
+g3<-arrange(g3, x2)
+g6<-arrange(g6, dsstox_substance_id)
+sum(g3$x1*g6$change_down)/sum(g3$x1)
+}  
+  
+
+thr3<-function(z,y){
+
+  androgen_down_pred<-data.frame(sapply(androgen$dsstox_substance_id, nebJ_androgen_down))
+androgen_down_pred$ID<-androgen$dsstox_substance_id
+
+colnames(androgen_down_pred)<-c("Prediction","ID")
+
+
+#setting the threshold for positive/negative outcomes 
+androgen_down_pred <- androgen_down_pred %>%
+  mutate(Prediction = case_when(Prediction > z ~1
+,Prediction < y ~0))
+
+
+#confusion matrix
+c<-confusionMatrix(as.factor(androgen_down_pred$Prediction), as.factor(androgen$change_down),positive="1")
+
+#sensitivity and specificity
+sens<-c$byClass[1]
+spef<-c$byClass[2]
+  
+
+hh<-c(spef,sens,sum(c$table),mean(c(spef,sens)))
+
+hh
+}
+
+
+wow4<-mapply(thr3, c(.5,.6,.7,.8,.9), .2)
+wow4<-t(wow4)
+colnames(wow4)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+wow5<-mapply(thr3, c(.5,.6,.7,.8,.9), .1)
+wow5<-t(wow5)
+colnames(wow5)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+thrd<-data.frame(rbind(wow4,wow5))
+
+thrd$upper<-rep(c(.5,.6,.7,.8,.9),2)
+thrd$lower<-c(rep(.2,5),rep(.1,5))
+
+thrd
+
+}
+
+tune1_an_down<-d1234_an_down(1)
+tune2_an_down<-d1234_an_down(2)
+tune3_an_down<-d1234_an_down(3)
+tune5_an_down<-d1234_an_down(5)
+tune7_an_down<-d1234_an_down(7)
+tune10_an_down<-d1234_an_down(10)
+
+
+tuning_androgen_down<-data.frame(rbind(tune1_an_down,tune2_an_down,tune3_an_down,tune5_an_down,tune7_an_down,tune10_an_down))
+
+tuning_androgen_down$Neighbors<-c(rep(1,10),rep(2,10),rep(3,10),rep(5,10),rep(7,10),rep(10,10))
+tuning_androgen_down$Model<-"Chemotypes_A_Down"
+
+tuning_androgen_down
+```
+
+## Tuning androgen up
+
+```{r changing cut off values androgen up, eval=F}
+d1234_an_up<-function(k){
+
+nebJ_androgen_up<-function(x){
+g<-which(colnames(jaccardchemo_estrogen)==x)
+g2<-data.frame(jaccardchemo_estrogen[,g],rownames(jaccardchemo_estrogen))
+colnames(g2)<-c("x1","x2")
+g2<-arrange(g2, desc(x1))
+g3<-slice(g2, 1:2)
+g6<-subset(androgen, dsstox_substance_id %in% g3$x2)
+g3<-arrange(g3, x2)
+g6<-arrange(g6, dsstox_substance_id)
+sum(g3$x1*g6$change_up)/sum(g3$x1)
+}  
+  
+
+thr3<-function(z,y){
+
+  androgen_up_pred<-data.frame(sapply(androgen$dsstox_substance_id, nebJ_androgen_up))
+androgen_up_pred$ID<-androgen$dsstox_substance_id
+
+colnames(androgen_up_pred)<-c("Prediction","ID")
+
+
+#setting the threshold for positive/negative outcomes
+androgen_up_pred <- androgen_up_pred %>%
+  mutate(Prediction = case_when(Prediction > z ~1
+,Prediction < y ~0))
+
+
+#confusion matrix
+c<-confusionMatrix(as.factor(androgen_up_pred$Prediction), as.factor(androgen$change_up),positive="1")
+
+#sensitivity and specificity
+sens<-c$byClass[1]
+spef<-c$byClass[2]
+  
+
+hh<-c(spef,sens,sum(c$table),mean(c(spef,sens)))
+
+hh
+}
+
+
+wow4<-mapply(thr3, c(.5,.6,.7,.8,.9), .2)
+wow4<-t(wow4)
+colnames(wow4)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+wow5<-mapply(thr3, c(.5,.6,.7,.8,.9), .1)
+wow5<-t(wow5)
+colnames(wow5)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+thrd<-data.frame(rbind(wow4,wow5))
+
+thrd$upper<-rep(c(.5,.6,.7,.8,.9),2)
+thrd$lower<-c(rep(.2,5),rep(.1,5))
+
+thrd
+
+}
+
+tune1_an_up<-d1234_an_up(1)
+tune2_an_up<-d1234_an_up(2)
+tune3_an_up<-d1234_an_up(3)
+tune5_an_up<-d1234_an_up(5)
+tune7_an_up<-d1234_an_up(7)
+tune10_an_up<-d1234_an_up(10)
+
+
+tuning_androgen_up<-data.frame(rbind(tune1_an_up,tune2_an_up,tune3_an_up,tune5_an_up,tune7_an_up,tune10_an_up))
+
+tuning_androgen_up$Neighbors<-c(rep(1,10),rep(2,10),rep(3,10),rep(5,10),rep(7,10),rep(10,10))
+tuning_androgen_up$Model<-"Chemotypes_A_up"
+
+tuning_androgen_up
+```
+
+
+# Morgan Fingerprint NN models for estrogens and androgens {.tabset .tabset-fade .tabset-pills}
+
+## Reading in smiles data
+```{r}
+e_names<-subset(opera, DTXSID %in% estrogen$dsstox_substance_id)$PREFERRED_NAME
+
+EA_SMILES<-estrogens_toxprints<-read_excel(path =  "Supp8_Estrogens_Androgens_Data.xlsx", sheet = 3)
+
+EA_SMILES[EA_SMILES == "-" ] <- NA
+
+EA_SMILES<-na.omit(EA_SMILES)
+#Dibutyltin dichloride, #Diphenylmercury(II), #Indium arsenide, and #Triphenylstibine do not have QSAR ready smiles
+
+```
+
+## Getting fingerprints and running similarity matrix using rcdk
+```{r}
+mols_ea <- parse.smiles(EA_SMILES$QSAR_READY_SMILES)
+fps_ea <- lapply(mols_ea, get.fingerprint)
+
+
+
+#similarity matrix
+fpsJ_ea<-data.frame(fp.sim.matrix(fps_ea))
+
+
+colnames(fpsJ_ea)<-c(EA_SMILES$DTXSID)
+rownames(fpsJ_ea)<-c(EA_SMILES$DTXSID)
+
+for(i in 1:ncol(fpsJ_ea)){
+  fpsJ_ea[i,i]=0
+}
+
+
+```
+
+
+## Tuning Morgan estrogen up
+
+```{r changing cut off values estrogen up morgan, eval=F}
+m1234_e_up<-function(k){
+
+nebJ_estrogen_up_m<-function(x){
+g<-which(colnames(fpsJ_ea)==x)
+g2<-data.frame(fpsJ_ea[,g],rownames(fpsJ_ea))
+g2<-arrange(g2, desc(fpsJ_ea...g.))
+g3<-slice(g2, 1:k)
+g6<-subset(estrogen, dsstox_substance_id %in% g3$rownames.fpsJ_ea.)
+g3<-arrange(g3, rownames.fpsJ_ea.)
+g6<-arrange(g6, dsstox_substance_id)
+sum(g3$fpsJ_ea...g.*g6$change_up)/sum(g3$fpsJ_ea...g.)
+}  
+  
+
+thr3<-function(z,y){
+
+  estrogen_up_pred_m<-data.frame(sapply(rownames(fpsJ_ea), nebJ_estrogen_up_m))
+estrogen_up_pred_m$ID<-rownames(fpsJ_ea)
+
+colnames(estrogen_up_pred_m)<-c("Prediction","ID")
+
+
+#setting the threshold for positive/negative outcomes
+estrogen_up_pred_m<- estrogen_up_pred_m %>%
+  mutate(Prediction = case_when(Prediction > z ~1
+,Prediction < y ~0))
+
+
+#confusion matrix
+estrogen_morg<-subset(estrogen, dsstox_substance_id %in% rownames(fpsJ_ea))
+
+c<-confusionMatrix(as.factor(estrogen_up_pred_m$Prediction), as.factor(estrogen_morg$change_up),positive="1")
+
+#sensitivity and specificity
+sens<-c$byClass[1]
+spef<-c$byClass[2]
+  
+
+hh<-c(spef,sens,sum(c$table),mean(c(spef,sens)))
+
+hh
+}
+
+
+wow4<-mapply(thr3, c(.5,.6,.7,.8,.9), .2)
+wow4<-t(wow4)
+colnames(wow4)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+wow5<-mapply(thr3, c(.5,.6,.7,.8,.9), .1)
+wow5<-t(wow5)
+colnames(wow5)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+thrd<-data.frame(rbind(wow4,wow5))
+
+thrd$upper<-rep(c(.5,.6,.7,.8,.9),2)
+thrd$lower<-c(rep(.2,5),rep(.1,5))
+
+thrd
+
+}
+
+tune1_e_m_up<-m1234_e_up(1)
+tune2_e_m_up<-m1234_e_up(2)
+tune3_e_m_up<-m1234_e_up(3)
+tune5_e_m_up<-m1234_e_up(5)
+tune7_e_m_up<-m1234_e_up(7)
+tune10_e_m_up<-m1234_e_up(10)
+
+
+
+tuning_estrogen_up_m<-data.frame(rbind(tune1_e_m_up,tune2_e_m_up,tune3_e_m_up,tune5_e_m_up,tune7_e_m_up,tune10_e_m_up))
+
+tuning_estrogen_up_m$Neighbors<-c(rep(1,10),rep(2,10),rep(3,10),rep(5,10),rep(7,10),rep(10,10))
+tuning_estrogen_up_m$Model<-"Morgan_E_up"
+
+tuning_estrogen_up_m
+```
+
+## Tuning Morgan estrogen down
+
+```{r changing cut off values estrogen down morgan, eval=F}
+m1234_e_down<-function(k){
+
+nebJ_estrogen_down_m<-function(x){
+g<-which(colnames(fpsJ_ea)==x)
+g2<-data.frame(fpsJ_ea[,g],rownames(fpsJ_ea))
+g2<-arrange(g2, desc(fpsJ_ea...g.))
+g3<-slice(g2, 1:k)
+g6<-subset(estrogen, dsstox_substance_id %in% g3$rownames.fpsJ_ea.)
+g3<-arrange(g3, rownames.fpsJ_ea.)
+g6<-arrange(g6, dsstox_substance_id)
+sum(g3$fpsJ_ea...g.*g6$change_down)/sum(g3$fpsJ_ea...g.)
+}  
+  
+
+thr3<-function(z,y){
+
+  estrogen_down_pred_m<-data.frame(sapply(rownames(fpsJ_ea), nebJ_estrogen_down_m))
+estrogen_down_pred_m$ID<-rownames(fpsJ_ea)
+
+colnames(estrogen_down_pred_m)<-c("Prediction","ID")
+
+
+#setting the threshold for positive/negative outcomes
+estrogen_down_pred_m<- estrogen_down_pred_m %>%
+  mutate(Prediction = case_when(Prediction > z ~1
+,Prediction < y ~0))
+
+
+#confusion matrix
+estrogen_morg<-subset(estrogen, dsstox_substance_id %in% rownames(fpsJ_ea))
+
+c<-confusionMatrix(as.factor(estrogen_down_pred_m$Prediction), as.factor(estrogen_morg$change_down),positive="1")
+
+#sensitivity and specificity
+sens<-c$byClass[1]
+spef<-c$byClass[2]
+  
+
+hh<-c(spef,sens,sum(c$table),mean(c(spef,sens)))
+
+hh
+}
+
+
+wow4<-mapply(thr3, c(.5,.6,.7,.8,.9), .2)
+wow4<-t(wow4)
+colnames(wow4)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+wow5<-mapply(thr3, c(.5,.6,.7,.8,.9), .1)
+wow5<-t(wow5)
+colnames(wow5)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+thrd<-data.frame(rbind(wow4,wow5))
+
+thrd$upper<-rep(c(.5,.6,.7,.8,.9),2)
+thrd$lower<-c(rep(.2,5),rep(.1,5))
+
+thrd
+
+}
+
+
+tune1_e_m_down<-m1234_e_down(1)
+tune2_e_m_down<-m1234_e_down(2)
+tune3_e_m_down<-m1234_e_down(3)
+tune5_e_m_down<-m1234_e_down(5)
+tune7_e_m_down<-m1234_e_down(7)
+tune10_e_m_down<-m1234_e_down(10)
+
+
+
+tuning_estrogen_down_m<-data.frame(rbind(tune1_e_m_down,tune2_e_m_down,tune3_e_m_down,tune5_e_m_down,tune7_e_m_down,tune10_e_m_down))
+
+tuning_estrogen_down_m$Neighbors<-c(rep(1,10),rep(2,10),rep(3,10),rep(5,10),rep(7,10),rep(10,10))
+tuning_estrogen_down_m$Model<-"Morgan_E_down"
+
+tuning_estrogen_down_m
+```
+
+
+## Tuning Morgan androgen up
+
+```{r changing cut off values androgen up morgan, eval=FALSE}
+androgen_morg<-subset(androgen, dsstox_substance_id %in% rownames(fpsJ_ea))
+
+androgen_morg<-androgen_morg[-which(duplicated(androgen_morg$dsstox_substance_id)),]
+
+m1234_a_up<-function(k){
+
+nebJ_androgen_up_m<-function(x){
+g<-which(colnames(fpsJ_ea)==x)
+g2<-data.frame(fpsJ_ea[,g],rownames(fpsJ_ea))
+g2<-arrange(g2, desc(fpsJ_ea...g.))
+g3<-slice(g2, 1:k)
+g6<-subset(androgen, dsstox_substance_id %in% g3$rownames.fpsJ_ea.)
+g3<-arrange(g3, rownames.fpsJ_ea.)
+g6<-arrange(g6, dsstox_substance_id)
+sum(g3$fpsJ_ea...g.*g6$change_up)/sum(g3$fpsJ_ea...g.)
+}  
+  
+
+thr3<-function(z,y){
+
+  androgen_up_pred_m<-data.frame(sapply(rownames(fpsJ_ea), nebJ_androgen_up_m))
+androgen_up_pred_m$ID<-rownames(fpsJ_ea)
+
+colnames(androgen_up_pred_m)<-c("Prediction","ID")
+
+
+#setting the threshold for positive/negative outcomes
+androgen_up_pred_m<- androgen_up_pred_m %>%
+  mutate(Prediction = case_when(Prediction > z ~1
+,Prediction < y ~0))
+
+
+#confusion matrix
+
+c<-confusionMatrix(as.factor(androgen_up_pred_m$Prediction), as.factor(androgen_morg$change_up),positive="1")
+
+#sensitivity and specificity
+sens<-c$byClass[1]
+spef<-c$byClass[2]
+  
+
+hh<-c(spef,sens,sum(c$table),mean(c(spef,sens)))
+
+hh
+}
+
+
+wow4<-mapply(thr3, c(.5,.6,.7,.8,.9), .2)
+wow4<-t(wow4)
+colnames(wow4)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+wow5<-mapply(thr3, c(.5,.6,.7,.8,.9), .1)
+wow5<-t(wow5)
+colnames(wow5)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+thrd<-data.frame(rbind(wow4,wow5))
+
+thrd$upper<-rep(c(.5,.6,.7,.8,.9),2)
+thrd$lower<-c(rep(.2,5),rep(.1,5))
+
+thrd
+
+}
+
+tune1_a_m_up<-m1234_a_up(1)
+tune2_a_m_up<-m1234_a_up(2)
+tune3_a_m_up<-m1234_a_up(3)
+tune5_a_m_up<-m1234_a_up(5)
+tune7_a_m_up<-m1234_a_up(7)
+tune10_a_m_up<-m1234_a_up(10)
+
+tuning_androgen_up_m<-data.frame(rbind(tune1_a_m_up,tune2_a_m_up,tune3_a_m_up,tune5_a_m_up,tune7_a_m_up,tune10_a_m_up))
+
+tuning_androgen_up_m$Neighbors<-c(rep(5,10),rep(7,10),rep(10,10))
+tuning_androgen_up_m$Model<-"Morgan_A_up"
+
+tuning_androgen_up_m
+```
+
+## Tuning Morgan androgen down 
+```{r Tuning morgan androgen down, eval=F}
+m1234_a_down<-function(k){
+
+nebJ_androgen_down_m<-function(x){
+g<-which(colnames(fpsJ_ea)==x)
+g2<-data.frame(fpsJ_ea[,g],rownames(fpsJ_ea))
+g2<-arrange(g2, desc(fpsJ_ea...g.))
+g3<-slice(g2, 1:k)
+g6<-subset(androgen, dsstox_substance_id %in% g3$rownames.fpsJ_ea.)
+g3<-arrange(g3, rownames.fpsJ_ea.)
+g6<-arrange(g6, dsstox_substance_id)
+sum(g3$fpsJ_ea...g.*g6$change_down)/sum(g3$fpsJ_ea...g.)
+}  
+  
+
+thr3<-function(z,y){
+
+  androgen_down_pred_m<-data.frame(sapply(rownames(fpsJ_ea), nebJ_androgen_down_m))
+androgen_down_pred_m$ID<-rownames(fpsJ_ea)
+
+colnames(androgen_down_pred_m)<-c("Prediction","ID")
+
+
+#setting the threshold for positive/negative outcomes
+androgen_down_pred_m<- androgen_down_pred_m %>%
+  mutate(Prediction = case_when(Prediction > z ~1
+,Prediction < y ~0))
+
+
+#confusion matrix
+
+c<-confusionMatrix(as.factor(androgen_down_pred_m$Prediction), as.factor(androgen_morg$change_down),positive="1")
+
+#sensitivity and specificity
+sens<-c$byClass[1]
+spef<-c$byClass[2]
+  
+
+hh<-c(spef,sens,sum(c$table),mean(c(spef,sens)))
+
+hh
+}
+
+
+wow4<-mapply(thr3, c(.5,.6,.7,.8,.9), .2)
+wow4<-t(wow4)
+colnames(wow4)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+wow5<-mapply(thr3, c(.5,.6,.7,.8,.9), .1)
+wow5<-t(wow5)
+colnames(wow5)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+thrd<-data.frame(rbind(wow4,wow5))
+
+thrd$upper<-rep(c(.5,.6,.7,.8,.9),2)
+thrd$lower<-c(rep(.2,5),rep(.1,5))
+
+thrd
+
+}
+
+tune1_a_m_down<-m1234_a_down(1)
+tune2_a_m_down<-m1234_a_down(2)
+tune3_a_m_down<-m1234_a_down(3)
+tune5_a_m_down<-m1234_a_down(5)
+tune7_a_m_down<-m1234_a_down(7)
+tune10_a_m_down<-m1234_a_down(10)
+
+tuning_androgen_down_m<-data.frame(rbind(tune1_a_m_down,tune2_a_m_down,tune3_a_m_down,tune5_a_m_down,tune7_a_m_down,tune10_a_m_down))
+
+tuning_androgen_down_m$Neighbors<-c(rep(5,10),rep(7,10),rep(10,10))
+tuning_androgen_down_m$Model<-"Morgan_A_down"
+
+tuning_androgen_down_m
+```
+
+
+```{r, eval=F}
+
+NNmodel_tuning_EA<-data.frame(rbind(tuning_estrogen_down,tuning_estrogen_up,tuning_estrogen_down_m,tuning_estrogen_up_m,tuning_androgen_down,tuning_androgen_up,tuning_androgen_down_m,tuning_androgen_up_m))
+```
+
+
+## Table of outcomes for EA model tuning 
+```{r}
+EA_nn_tuning<-read_excel(path = "Supp4_Nearest_Neighbor_Outputs.xlsx", sheet = 6)
+EA_nn_tuning
+```
+
+
+
+
+# EDSP Chemical Predictions in Chemotype Estrogen and Androgen NN Model {.tabset .tabset-fade .tabset-pills}
+
+The problem with these models and why we don't use the Estrogen/Androgen NN models for anything is because all of the outcomes are predicted as 0
+
+## Reading in data
+
+```{r message=FALSE, warning=FALSE}
+jaccardEDSP_EA <-read_excel(path =  "Supp8_Estrogens_Androgens_Data.xlsx", sheet = 4)
+
+rownames(jaccardEDSP_EA)<-jaccardEDSP_EA$X
+jaccardEDSP_EA<-jaccardEDSP_EA[,-1]
+```
+
+
+## Estrogen up predictions
+
+Output is the table of predictions (1 or 0)
+```{r getting EDSP chemotype predictions E up}
+
+
+EDSP_estrogen_up<-function(x){
+g<-which(colnames(jaccardEDSP_EA)==x)
+g2<-data.frame(jaccardEDSP_EA[,g],rownames(jaccardEDSP_EA))
+colnames(g2)<-c("x1","x2")
+g2<-arrange(g2, desc(x1))
+g3<-slice(g2, 1)
+g6<-subset(estrogen, dsstox_substance_id %in% g3$x2)
+g3<-arrange(g3, x2)
+g6<-arrange(g6, dsstox_substance_id)
+sum(g3$x1*g6$change_up)/sum(g3$x1)
+
+}  
+
+
+
+  estrogen_up_pred_edsp<-data.frame(sapply(colnames(jaccardEDSP_EA), EDSP_estrogen_up))
+estrogen_up_pred_edsp$ID<-colnames(jaccardEDSP_EA)
+
+colnames(estrogen_up_pred_edsp)<-c("Prediction","ID")
+
+
+
+#setting the threshold for positive/negative outcomes
+estrogen_up_pred_edsp<- estrogen_up_pred_edsp %>%
+  mutate(Prediction = case_when(Prediction > .9 ~1
+,Prediction < .1 ~0))
+
+table(estrogen_up_pred_edsp$Prediction)
+```
+
+## Estrogen Down
+
+Output is the table of predictions (1 or 0)
+```{r  EDSP chemotype predictions E down}
+EDSP_estrogen_down<-function(x){
+g<-which(colnames(jaccardEDSP_EA)==x)
+g2<-data.frame(jaccardEDSP_EA[,g],rownames(jaccardEDSP_EA))
+colnames(g2)<-c("x1","x2")
+g2<-arrange(g2, desc(x1))
+g3<-slice(g2, 1:2)
+g6<-subset(estrogen, dsstox_substance_id %in% g3$x2)
+g3<-arrange(g3, x2)
+g6<-arrange(g6, dsstox_substance_id)
+sum(g3$x1*g6$change_down)/sum(g3$x1)
+}  
+  
+
+
+  estrogen_down_pred_edsp<-data.frame(sapply(colnames(jaccardEDSP_EA), EDSP_estrogen_down))
+estrogen_down_pred_edsp$ID<-colnames(jaccardEDSP_EA)
+
+colnames(estrogen_down_pred_edsp)<-c("Prediction","ID")
+
+
+
+estrogen_down_pred_edsp<- estrogen_down_pred_edsp %>%
+  mutate(Prediction = case_when(Prediction > .5 ~1
+,Prediction < .2 ~0))
+
+table(estrogen_down_pred_edsp$Prediction)
+```
+
+## Androgen Down
+
+Output is the table of predictions (1 or 0)
+```{r  EDSP chemotype predictions A down}
+EDSP_androgen_down<-function(x){
+g<-which(colnames(jaccardEDSP_EA)==x)
+g2<-data.frame(jaccardEDSP_EA[,g],rownames(jaccardEDSP_EA))
+colnames(g2)<-c("x1","x2")
+g2<-arrange(g2, desc(x1))
+g3<-slice(g2, 1:2)
+g6<-subset(androgen, dsstox_substance_id %in% g3$x2)
+g3<-arrange(g3, x2)
+g6<-arrange(g6, dsstox_substance_id)
+sum(g3$x1*g6$change_down)/sum(g3$x1)
+}  
+  
+
+
+  androgen_down_pred_edsp<-data.frame(sapply(colnames(jaccardEDSP_EA), EDSP_androgen_down))
+androgen_down_pred_edsp$ID<-colnames(jaccardEDSP_EA)
+
+colnames(androgen_down_pred_edsp)<-c("Prediction","ID")
+
+
+
+androgen_down_pred_edsp<- androgen_down_pred_edsp %>%
+  mutate(Prediction = case_when(Prediction > .5 ~1
+,Prediction < .2 ~0))
+
+table(androgen_down_pred_edsp$Prediction)
+```
+
+## Androgen Up
+
+Output is the table of predictions (1 or 0)
+```{r  EDSP chemotype predictions A up}
+EDSP_androgen_up<-function(x){
+g<-which(colnames(jaccardEDSP_EA)==x)
+g2<-data.frame(jaccardEDSP_EA[,g],rownames(jaccardEDSP_EA))
+colnames(g2)<-c("x1","x2")
+g2<-arrange(g2, desc(x1))
+g3<-slice(g2, 1:2)
+g6<-subset(androgen, dsstox_substance_id %in% g3$x2)
+g3<-arrange(g3, x2)
+g6<-arrange(g6, dsstox_substance_id)
+sum(g3$x1*g6$change_up)/sum(g3$x1)
+}  
+  
+
+
+  androgen_up_pred_edsp<-data.frame(sapply(colnames(jaccardEDSP_EA), EDSP_androgen_up))
+androgen_up_pred_edsp$ID<-colnames(jaccardEDSP_EA)
+
+colnames(androgen_up_pred_edsp)<-c("Prediction","ID")
+
+
+
+androgen_up_pred_edsp<- androgen_up_pred_edsp %>%
+  mutate(Prediction = case_when(Prediction > .5 ~1
+,Prediction < .2 ~0))
+
+table(androgen_up_pred_edsp$Prediction)
+```
+
+
+# Estrogen and Androgen Enrichment by Change up and down {.tabset .tabset-fade .tabset-pills}
+
+## Data import and cleaning
+```{r}
+estrogens_toxprints_2<-read_excel(path =  "Supp8_Estrogens_Androgens_Data.xlsx", sheet = 2)
+
+
+estrogens_toxprints_2[estrogens_toxprints_2== "-"] <- NA
+#643 of 654 chemicals are structurable
+estrogens_toxprints_2<-na.omit(estrogens_toxprints_2)
+#403 of 729 chemotypes present
+estrogens_toxprints_2<-remove_constant(estrogens_toxprints_2)
+estrogens_toxprints3<-estrogens_toxprints_2[,-c(1,3)]
+estrogens_toxprints3<-data.frame(estrogens_toxprints3[-611,])
+colnames(estrogens_toxprints3)[1]<-"dsstox_substance_id"
+
+e_enrichment_ready<-left_join(estrogen, estrogens_toxprints3, by="dsstox_substance_id")
+
+a_enrichment_ready<-left_join(androgen, estrogens_toxprints3, by="dsstox_substance_id")
+
+```
+
+## Estrogen up
+
+```{r}
+dataE_up<-matrix(NA,ncol=4,nrow=403)
+for(i in 6:408){
+  tf<-table(e_enrichment_ready[,i]==1, e_enrichment_ready$change_up)
+  fttf<-fisher.test(tf)
+  dataE_up[i-5,]<-c(fttf$p.value, fttf$estimate, fttf$conf.int)
+}
+
+dataE_up<-data.frame(dataE_up)
+colnames(dataE_up)<-c("Pval","Odds_Ratio","Lower","Upper")
+dataE_up$Chemotype<-colnames(e_enrichment_ready)[6:408]
+
+dataE_up$padj<-p.adjust(dataE_up$Pval, method="fdr")
+sigorE_up<-arrange(dataE_up, desc(padj))
+sigorE_up<-subset(sigorE_up, Odds_Ratio >3 & Pval<0.01& is.finite(Odds_Ratio)& is.finite(Upper))
+sigorE_up$Model<-"Estrogen Up"
+
+sigorE_up
+```
+
+## Estrogen Down
+
+```{r}
+dataE_down<-matrix(NA,ncol=4,nrow=403)
+for(i in 6:408){
+  tf<-table(e_enrichment_ready[,i]==1, e_enrichment_ready$change_down)
+  fttf<-fisher.test(tf)
+  dataE_down[i-5,]<-c(fttf$p.value, fttf$estimate, fttf$conf.int)
+}
+
+dataE_down<-data.frame(dataE_down)
+colnames(dataE_down)<-c("Pval","Odds_Ratio","Lower","Upper")
+dataE_down$Chemotype<-colnames(e_enrichment_ready)[6:408]
+
+dataE_down$padj<-p.adjust(dataE_down$Pval, method="fdr")
+sigorE_down<-arrange(dataE_down, padj)
+sigorE_down<-subset(sigorE_down, Odds_Ratio >3 & Pval<0.01& is.finite(Odds_Ratio)& is.finite(Upper))
+
+sigorE_down$Model<-"Estrogen Down"
+sigorE_down
+```
+
+
+## Androgen Up
+```{r}
+
+dataA_up<-matrix(NA,ncol=4,nrow=403)
+for(i in 6:408){
+  tf<-table(a_enrichment_ready[,i]==1, a_enrichment_ready$change_up)
+  fttf<-fisher.test(tf)
+  dataA_up[i-5,]<-c(fttf$p.value, fttf$estimate, fttf$conf.int)
+}
+
+dataA_up<-data.frame(dataA_up)
+colnames(dataA_up)<-c("Pval","Odds_Ratio","Lower","Upper")
+dataA_up$Chemotype<-colnames(e_enrichment_ready)[6:408]
+
+
+dataA_up$padj<-p.adjust(dataA_up$Pval, method="fdr")
+sigorA_up<-arrange(dataA_up, padj)
+sigorA_up<-subset(sigorA_up, padj<0.01)
+
+sigorA_up$Model<-"Androgen Up"
+
+
+sigorA_up
+```
+
+## Androgen Down
+
+```{r}
+dataA_down<-matrix(NA,ncol=4,nrow=403)
+for(i in 6:408){
+  tf<-table(a_enrichment_ready[,i]==1, a_enrichment_ready$change_down)
+  fttf<-fisher.test(tf)
+  dataA_down[i-5,]<-c(fttf$p.value, fttf$estimate, fttf$conf.int)
+}
+
+dataA_down<-data.frame(dataA_down)
+colnames(dataA_down)<-c("Pval","Odds_Ratio","Lower","Upper")
+dataA_down$Chemotype<-colnames(e_enrichment_ready)[6:408]
+
+dataA_down$padj<-p.adjust(dataA_down$Pval, method="fdr")
+sigorA_down<-arrange(dataA_down, padj)
+sigorA_down<-subset(sigorA_down, Odds_Ratio >3 & Pval<0.01& is.finite(Odds_Ratio)& is.finite(Upper))
+
+sigorA_down$Model<-"Androgen Down"
+
+sigorA_down
+```
+
+
+## All data combined into a data frame E/A up down 
+```{r}
+
+colnames(sigorE_down)<-colnames(sigorA_up)
+colnames(sigorE_up)<-colnames(sigorA_up)
+colnames(sigorA_down)<-colnames(sigorA_up)
+
+
+
+enrichment_EA_updown<-data.frame(rbind(sigorE_up, sigorE_down,sigorA_up,sigorA_down))
+
+
+enrichment_EA_updown<-arrange(enrichment_EA_updown, Chemotype)
+enrichment_EA_updown$numchem<-as.numeric(as.factor(enrichment_EA_updown$Chemotype))
+
+enrichment_EA_updown$numchem2<-paste(enrichment_EA_updown$numchem,enrichment_EA_updown$Chemotype, sep=") ")
+
+
+
+enrichment_EA_updown$numchem<-as.factor(enrichment_EA_updown$numchem)
+
+enrichment_EA_updown$numchem2<-as.factor(enrichment_EA_updown$numchem2)
+
+enrichment_EA_updown$numchem2<-reorder.factor(enrichment_EA_updown$numchem2, new.order = c(1,7,8,9,10,11,12,13,14,2,3,4,5,6))
+
+
+enrichment_EA_updown<-arrange(enrichment_EA_updown, Chemotype)
+
+enrichment_EA_updown_tab<-enrichment_EA_updown[,c(7,5,2,3,4,6,1)]
+
+colnames(enrichment_EA_updown_tab)<-c("Model","Chemotype","Odds Ratio","Lower Bound","Upper Bound","Adjusted P-value", "Unadjusted P-value")
+
+```
+
+
+
+## Summary enrichment figure
+
+```{r, fig.height=8,fig.width=10}
+enrichment_EA_updown_M<-reshape2::melt(enrichment_EA_updown, id.vars=c("Model","Chemotype","Pval","numchem","numchem2","padj"))
+
+supp.labs <- c("Androgen Down", "Androgen Up","Estrogen Down","Estrogen Up")
+names(supp.labs) <- c("Androgen Down", "Androgen Up","Estrogen Down","Estrogen Up")
+
+
+EA_enrich_plot<-ggplot(enrichment_EA_updown_M, aes(x=value, y=numchem, color=numchem2))+geom_point(size=2)+geom_line()+facet_wrap(. ~ Model, scales="free_x",labeller = labeller(Model = supp.labs))+labs(color="Chemotype",y="Chemotype", x="Odds Ratio of a +/-log2(1.5) Fold Change given Chemotype Presence")+theme_bw()+
+  scale_y_discrete(limits = c("15","14","13","12","11","10","9","8","7","6","5","4","3","2","1"))+ theme(panel.spacing = unit(2, "lines"))
+
+EA_enrich_plot
+
+
+```
+
+# Looking to see which chemicals have the enriched toxprint combinations {.tabset .tabset-fade .tabset-pills}
+
+```{r }
+
+testchems2<-testchems
+testchems2<-testchems2[,order(colnames(testchems2))]
+
+testchems3<-t(testchems2)
+
+#redoing this even if the column is all 0s we need to include it so that the two matrices have the same number of columns
+estrogens_toxprints<-read_excel(path =  "Supp8_Estrogens_Androgens_Data.xlsx", sheet = 2)
+
+estrogens_toxprints[estrogens_toxprints== "-"] <- NA
+estrogens_toxprints<-na.omit(estrogens_toxprints)
+
+etoxprints_jaccard_ready<-na.omit(estrogens_toxprints)
+
+etoxprints_jaccard_ready<-etoxprints_jaccard_ready[,-c(1:3)]
+
+etoxprints_jaccard_ready <- data.frame(sapply(etoxprints_jaccard_ready, as.numeric))
+
+etoxprints_jaccard_ready[etoxprints_jaccard_ready==2]<-0
+etoxprints_jaccard_ready[etoxprints_jaccard_ready==3]<-1
+
+
+etoxprints_jaccard_ready<-etoxprints_jaccard_ready[,which(names(etoxprints_jaccard_ready) %in% colnames(testchems2))]
+
+etoxprints_jaccard_ready<-etoxprints_jaccard_ready[,order(colnames(etoxprints_jaccard_ready))]
+
+etoxprints_jaccard_ready<-etoxprints_jaccard_ready[-611,]
+estrogens_toxprints2 <- estrogens_toxprints[-611,]
+
+rownames(etoxprints_jaccard_ready)<-estrogens_toxprints2$PREFERRED_NAME
+
+
+etoxprints_jaccard_ready2<-t(etoxprints_jaccard_ready)
+
+```
+
+```{r}
+chems33<-setdiff(unique(outcomes$Chemical), colnames(testchems3))
+chems33<-chems33[12:44]
+
+dat33<-subset(operafull2dis, chnm %in% chems33)
+
+
+
+Missing <- setdiff(rownames(testchems3), colnames(dat33))
+dat33[Missing] <- 0                   
+dat33 <- dat33[rownames(testchems3)]  
+tdat33<-t(dat33)
+colnames(tdat33)<-chems33
+
+testchems4<-cbind(testchems3, tdat33)
+
+names7702<-colnames(testchems4)[(colnames(testchems4) %in% outcomes$Chemical)]
+
+testchems4<-testchems4[, names7702]
+
+
+
+```
+
+
+
+## Function for outputting chemicals with enriched chemotypes in E up and A up/down
+```{r}
+which_chem_edsp_EA<-function(x,y){
+   one<-subset(testchems4, rownames(testchems4) %in% x$Chemotype)
+two<-which(colSums(one)>=y)
+four<-cbind(colnames(testchems4)[two], colSums(one)[which(colSums(one)>=y)])
+
+six<-data.frame(rbind(four))
+colnames(six)<-c("Chemical","# Chemotypes")
+rownames(six)<-NULL
+six
+}
+```
+
+
+```{r }
+sigorE_up_chem<-which_chem_edsp_EA(sigorE_up, 0)
+colnames(sigorE_up_chem)[2]<-"# Chemotypes Estrogen Up"
+
+
+sigorE_down_chem<-which_chem_edsp_EA(sigorE_down, 0)
+colnames(sigorE_down_chem)[2]<-"# Chemotypes Estrogen Down"
+
+
+sigorA_up_chem<-which_chem_edsp_EA(sigorA_up, 0)
+colnames(sigorA_up_chem)[2]<-"# Chemotypes Androgen Up"
+
+sigorA_down_chem<-which_chem_edsp_EA(sigorA_down, 0)
+colnames(sigorA_down_chem)[2]<-"# Chemotypes Androgen Down"
+
+
+Efull<-full_join(sigorE_down_chem, sigorE_up_chem, by="Chemical")
+Afull<-full_join(sigorA_down_chem, sigorA_up_chem, by="Chemical")
+EAfull<-full_join(Efull, Afull, by="Chemical")
+
+EAfull$`# Chemotypes Estrogen Down`<-as.numeric(EAfull$`# Chemotypes Estrogen Down`)
+
+EAfull$`# Chemotypes Estrogen Up`<-as.numeric(EAfull$`# Chemotypes Estrogen Up`)
+
+EAfull$`# Chemotypes Androgen Down`<-as.numeric(EAfull$`# Chemotypes Androgen Down`)
+
+EAfull$`# Chemotypes Androgen Up`<-as.numeric(EAfull$`# Chemotypes Androgen Up`)
+
+####
+
+EAfull$`# Chemotypes Estrogen Down`<-EAfull$`# Chemotypes Estrogen Down`-1
+
+EAfull$`# Chemotypes Estrogen Up`<-EAfull$`# Chemotypes Estrogen Up`-1
+
+EAfull$`# Chemotypes Androgen Down`<-EAfull$`# Chemotypes Androgen Down`-1
+
+EAfull$`# Chemotypes Androgen Up`<-EAfull$`# Chemotypes Androgen Up`-1
+```
+
+```{r}
+EA_outcomes<-full_join(outcomes, EAfull, by="Chemical")
+
+
+EA_outcomes<-EA_outcomes[-c(11:14)]
+
+EA_outcomes<- EA_outcomes %>% mutate(Eup = case_when(`# Chemotypes Estrogen Up` > 0 ~ 1,
+TRUE ~0))
+
+EA_outcomes<- EA_outcomes %>% mutate(Edown = case_when(`# Chemotypes Estrogen Down` > 0 ~ 1,
+TRUE ~0))
+
+EA_outcomes<- EA_outcomes %>% mutate(Aup = case_when(`# Chemotypes Androgen Up` > 0 ~ 1,
+TRUE ~0))
+
+EA_outcomes<- EA_outcomes %>% mutate(Adown = case_when(`# Chemotypes Androgen Down` > 0 ~ 1,
+TRUE ~0))
+
+```
+
+
+
+# E/A Chemotype Accuracy 
+
+The code outputs the accuracy of the 1400 test chemicals based on a decision tree approach. If there is at least enriched 1 chemotype present we call that chemical a positive, if not assign that a negative.
+
+```{r}
+##getting the 1400 test chemicals from the outcomes data
+edsp_data_EA_acc<-outcomes
+edsp_data_EA_acc<-subset(edsp_data_EA_acc, Actual=="positive"|Actual=="negative")
+
+EA_acc<-function(x,y){
+  #testchems 3 is a data frame with all the chemotypes for rows and all the chemicals for columns, when we subset this data frame by chemeotypes in x we get only enriched chemotypes in e up or down etc.
+ one<-subset(testchems3, rownames(testchems3) %in% x$Chemotype)
+
+ #if we sum all the columns in "one" then we can see which chemicals have at least one enriched chemotype or any number greater than y. make new pos/neg in new column.
+edsp_data_EA_acc<- edsp_data_EA_acc %>% mutate(col = case_when(Chemical %in% colnames(one)[which(colSums(one)>y)] ~ "positive",
+TRUE ~"negative"))
+
+#get sens/spef etc. using confusionMatrix
+cm_eup<-confusionMatrix(as.factor(edsp_data_EA_acc$col), as.factor(edsp_data_EA_acc$Actual), positive = "positive")
+sens<-cm_eup$byClass[1]
+spef<-cm_eup$byClass[2]
+kappa<-cm_eup$overall[2]
+acc<-(sens+spef)/2
+oob<-1-acc
+output<-data.frame(sens,spef,kappa,acc,oob)
+colnames(output)<-c("Sensitivity","Specificity","Kappa","Accuracy","OOB")
+output
+}
+accE_up<-EA_acc(sigorE_up,0)
+accE_down<-EA_acc(sigorE_down,0)
+accA_up<-EA_acc(sigorA_up,0)
+accA_down<-EA_acc(sigorA_down,0)
+
+
+
+EA_Acc<-data.frame(rbind(accE_up,accE_down,accA_up, accA_down))
+rownames(EA_Acc)<-c("Estrogen Up","Estrogen Down","Androgen Up","Androgen Down")
+
+#ggtexttable(round(EA_Acc,2))
+
+round(EA_Acc,2)
+
+EA_Acc
+```
+
+
+
+
+## How many chemicals are classified as pos/neg in decision tree approach
+
+```{r}
+
+EA_DT_num<-function(x){
+ edsp_data_EA_acc<-outcomes
+edsp_data_EA_acc<-subset(edsp_data_EA_acc, Actual=="positive"|Actual=="negative")
+
+
+ one<-subset(testchems3, rownames(testchems3) %in% x$Chemotype)
+ 
+ 
+
+edsp_data_EA_acc<- edsp_data_EA_acc %>% mutate(col = case_when(Chemical %in% colnames(one)[which(colSums(one)>0)] ~ "positive",
+TRUE ~"negative"))
+
+table(edsp_data_EA_acc$col) 
+}
+
+EA_DT_num(sigorE_up)
+EA_DT_num(sigorE_down)
+EA_DT_num(sigorA_up)
+EA_DT_num(sigorA_down)
+
+
+```
+
+For estrogen up `r EA_DT_num(sigorE_up)`
+
+For estrogen down `r EA_DT_num(sigorE_down)`
+
+For androgen up `r EA_DT_num(sigorA_up)`
+
+For androgen down `r EA_DT_num(sigorA_down)`
+
+
+
+# Random Forest for Estrogens and Androgens {.tabset .tabset-fade .tabset-pills}
+
+## Estrogens data cleaning
+
+```{r , message=F, warning=F}
+estrogens_op_ch<-read_excel(path =  "Supp8_Estrogens_Androgens_Data.xlsx", sheet = 5)
+estrogens_op_ch<-estrogens_op_ch[,-1]
+colnames(estrogens_op_ch)[1]<-"dsstox_substance_id"
+
+
+estrogens_op_ch2<-left_join(estrogen, estrogens_op_ch, by="dsstox_substance_id")
+
+estrogens_op_ch2<-estrogens_op_ch2[!duplicated(estrogens_op_ch2),]
+
+
+estrogens_op_ch2[,7:748]<-sapply(estrogens_op_ch2[,7:748], as.numeric)
+
+
+estrogens_op_ch3<-estrogens_op_ch2[,-which(colSums(estrogens_op_ch2[,7:747])==0)]
+
+estrogens_op_ch3<-na.omit(estrogens_op_ch3)
+
+
+estrogens_op_ch3$change_up<-as.factor(estrogens_op_ch3$change_up)
+
+estrogens_op_ch3<- estrogens_op_ch3 %>% mutate(change_up = case_when(change_up =="1" ~"positive"
+,change_up=="0" ~"negative"))
+
+estrogens_op_ch3$change_down<-as.factor(estrogens_op_ch3$change_down)
+
+estrogens_op_ch3<- estrogens_op_ch3 %>% mutate(change_down = case_when(change_down =="1" ~"positive"
+,change_down=="0" ~"negative"))
+
+estrogens_op_ch3$change_down<-as.factor(estrogens_op_ch3$change_down)
+
+estrogens_op_ch3$change_up<-as.factor(estrogens_op_ch3$change_up)
+
+estrogens_op_ch3$change_down <- relevel(estrogens_op_ch3$change_down, ref = "positive")
+
+estrogens_op_ch3$change_up <- relevel(estrogens_op_ch3$change_up, ref = "positive")
+
+```
+
+## Estrogens opera only
+
+```{r eval=F}
+operaform_eup<-as.formula(change_up~`ATMOSPHERIC_HYDROXYLATION_RATE_(AOH)_CM3/MOLECULE*SEC_OPERA_PRED`+BIOCONCENTRATION_FACTOR_OPERA_PRED+BIODEGRADATION_HALF_LIFE_DAYS_DAYS_OPERA_PRED+BOILING_POINT_DEGC_OPERA_PRED+       `HENRYS_LAW_ATM-M3/MOLE_OPERA_PRED`+OPERA_KM_DAYS_OPERA_PRED+OCTANOL_AIR_PARTITION_COEFF_LOGKOA_OPERA_PRED+`SOIL_ADSORPTION_COEFFICIENT_KOC_L/KG_OPERA_PRED`+OCTANOL_WATER_PARTITION_LOGP_OPERA_PRED+MELTING_POINT_DEGC_OPERA_PRED+VAPOR_PRESSURE_MMHG_OPERA_PRED+`WATER_SOLUBILITY_MOL/L_OPERA_PRED`+AVERAGE_MASS)
+
+eup_opera_rep_cv<-rf_rep_cv(seed=12, mtry1=sqrt(13),formula =operaform_eup, data1=estrogens_op_ch3)
+
+eup_opera_rep_cv
+```
+
+```{r eval=F}
+operaform_edown<-as.formula(change_down~`ATMOSPHERIC_HYDROXYLATION_RATE_(AOH)_CM3/MOLECULE*SEC_OPERA_PRED`+BIOCONCENTRATION_FACTOR_OPERA_PRED+BIODEGRADATION_HALF_LIFE_DAYS_DAYS_OPERA_PRED+BOILING_POINT_DEGC_OPERA_PRED+       `HENRYS_LAW_ATM-M3/MOLE_OPERA_PRED`+OPERA_KM_DAYS_OPERA_PRED+OCTANOL_AIR_PARTITION_COEFF_LOGKOA_OPERA_PRED+`SOIL_ADSORPTION_COEFFICIENT_KOC_L/KG_OPERA_PRED`+OCTANOL_WATER_PARTITION_LOGP_OPERA_PRED+MELTING_POINT_DEGC_OPERA_PRED+VAPOR_PRESSURE_MMHG_OPERA_PRED+`WATER_SOLUBILITY_MOL/L_OPERA_PRED`+AVERAGE_MASS)
+
+edown_opera_rep_cv<-rf_rep_cv(seed=12, mtry1=sqrt(13),formula =operaform_edown, data1=estrogens_op_ch3)
+
+edown_opera_rep_cv
+```
+
+## Estrogens Chemotypes only
+
+```{r eval=F}
+chemoform_eup<-as.formula(change_up~.-dsstox_substance_id-chnm-change-change_down-PREFERRED_NAME-`ATMOSPHERIC_HYDROXYLATION_RATE_(AOH)_CM3/MOLECULE*SEC_OPERA_PRED`-BIOCONCENTRATION_FACTOR_OPERA_PRED-BIODEGRADATION_HALF_LIFE_DAYS_DAYS_OPERA_PRED-BOILING_POINT_DEGC_OPERA_PRED-       `HENRYS_LAW_ATM-M3/MOLE_OPERA_PRED`-OPERA_KM_DAYS_OPERA_PRED-OCTANOL_AIR_PARTITION_COEFF_LOGKOA_OPERA_PRED-`SOIL_ADSORPTION_COEFFICIENT_KOC_L/KG_OPERA_PRED`-OCTANOL_WATER_PARTITION_LOGP_OPERA_PRED-MELTING_POINT_DEGC_OPERA_PRED-VAPOR_PRESSURE_MMHG_OPERA_PRED-`WATER_SOLUBILITY_MOL/L_OPERA_PRED`-AVERAGE_MASS)
+
+eup_chemo_rep_cv<-rf_rep_cv(seed=12, mtry1=sqrt(403),formula =chemoform_eup, data1=estrogens_op_ch3)
+eup_chemo_rep_cv
+```
+
+```{r eval=F}
+chemoform_edown<-as.formula(change_down~.-dsstox_substance_id-chnm-change-change_up-PREFERRED_NAME-`ATMOSPHERIC_HYDROXYLATION_RATE_(AOH)_CM3/MOLECULE*SEC_OPERA_PRED`-BIOCONCENTRATION_FACTOR_OPERA_PRED-BIODEGRADATION_HALF_LIFE_DAYS_DAYS_OPERA_PRED-BOILING_POINT_DEGC_OPERA_PRED-       `HENRYS_LAW_ATM-M3/MOLE_OPERA_PRED`-OPERA_KM_DAYS_OPERA_PRED-OCTANOL_AIR_PARTITION_COEFF_LOGKOA_OPERA_PRED-`SOIL_ADSORPTION_COEFFICIENT_KOC_L/KG_OPERA_PRED`-OCTANOL_WATER_PARTITION_LOGP_OPERA_PRED-MELTING_POINT_DEGC_OPERA_PRED-VAPOR_PRESSURE_MMHG_OPERA_PRED-`WATER_SOLUBILITY_MOL/L_OPERA_PRED`-AVERAGE_MASS)
+
+edown_chemo_rep_cv<-rf_rep_cv(seed=12, mtry1=sqrt(403),formula =chemoform_edown, data1=estrogens_op_ch3)
+
+```
+
+
+## Estrogens Chemotypes and OPERA
+
+```{r eval=F}
+ocform_eup<-as.formula(change_up~.-dsstox_substance_id-chnm-change-change_down-PREFERRED_NAME)
+
+eup_oc_rep_cv<-rf_rep_cv(seed=12, mtry1=sqrt(416),formula =ocform_eup, data1=estrogens_op_ch3)
+
+eup_oc_rep_cv
+```
+
+```{r eval=F}
+ocform_edown<-as.formula(change_down~.-dsstox_substance_id-chnm-change-change_up-PREFERRED_NAME)
+
+edown_oc_rep_cv<-rf_rep_cv(seed=12, mtry1=sqrt(416),formula =ocform_edown, data1=estrogens_op_ch3)
+
+
+```
+
+## Morgan Fingerprint RF Estrogens Data cleaning
+```{r}
+#generating Morgan fingerprint matrix
+fps_eaM<-fp.to.matrix(fps_ea)
+fps_eaM<-data.frame(fps_eaM)
+fps_eaM$dsstox_substance_id<-EA_SMILES$DTXSID
+fps_eaM$chnm<-EA_SMILES$PREFERRED_NAME
+fps_eaM<-fps_eaM[-which(fps_eaM$dsstox_substance_id=="DTXSID0021331"),]
+
+#making sure the two data frames have the same substance in the exact same order so I can directly add onto them
+fps_eaM<-arrange(fps_eaM, dsstox_substance_id)
+estrogens_op_ch3<-arrange(estrogens_op_ch3, dsstox_substance_id)
+
+#adding fold changes
+fps_eaM$change_up<-estrogens_op_ch3$change_up
+fps_eaM$change_down<-estrogens_op_ch3$change_down
+
+#adding opera
+fps_eaM[,1029:1042]<-estrogens_op_ch3[,410:422]
+```
+
+## Estrogens Morgan Fingerprints only
+
+```{r eval=F}
+morgform_eup<-as.formula(change_up~.-dsstox_substance_id-chnm-change_down-`ATMOSPHERIC_HYDROXYLATION_RATE_(AOH)_CM3/MOLECULE*SEC_OPERA_PRED`-BIOCONCENTRATION_FACTOR_OPERA_PRED-BIODEGRADATION_HALF_LIFE_DAYS_DAYS_OPERA_PRED-BOILING_POINT_DEGC_OPERA_PRED-       `HENRYS_LAW_ATM-M3/MOLE_OPERA_PRED`-OPERA_KM_DAYS_OPERA_PRED-OCTANOL_AIR_PARTITION_COEFF_LOGKOA_OPERA_PRED-`SOIL_ADSORPTION_COEFFICIENT_KOC_L/KG_OPERA_PRED`-OCTANOL_WATER_PARTITION_LOGP_OPERA_PRED-MELTING_POINT_DEGC_OPERA_PRED-VAPOR_PRESSURE_MMHG_OPERA_PRED-`WATER_SOLUBILITY_MOL/L_OPERA_PRED`-AVERAGE_MASS)
+
+eup_morg_rep_cv<-rf_rep_cv(seed=12, mtry1=sqrt(1024),formula =morgform_eup, data1=fps_eaM)
+
+eup_morg_rep_cv
+```
+
+
+```{r eval=F}
+morgform_edown<-as.formula(change_down~.-dsstox_substance_id-chnm-change_up-`ATMOSPHERIC_HYDROXYLATION_RATE_(AOH)_CM3/MOLECULE*SEC_OPERA_PRED`-BIOCONCENTRATION_FACTOR_OPERA_PRED-BIODEGRADATION_HALF_LIFE_DAYS_DAYS_OPERA_PRED-BOILING_POINT_DEGC_OPERA_PRED-       `HENRYS_LAW_ATM-M3/MOLE_OPERA_PRED`-OPERA_KM_DAYS_OPERA_PRED-OCTANOL_AIR_PARTITION_COEFF_LOGKOA_OPERA_PRED-`SOIL_ADSORPTION_COEFFICIENT_KOC_L/KG_OPERA_PRED`-OCTANOL_WATER_PARTITION_LOGP_OPERA_PRED-MELTING_POINT_DEGC_OPERA_PRED-VAPOR_PRESSURE_MMHG_OPERA_PRED-`WATER_SOLUBILITY_MOL/L_OPERA_PRED`-AVERAGE_MASS)
+
+edown_morg_rep_cv<-rf_rep_cv(seed=12, mtry1=sqrt(1024),formula =morgform_edown, data1=fps_eaM)
+
+edown_morg_rep_cv
+```
+
+## Estrogens Morgan Fingerprints and OPERA
+
+```{r eval=F}
+moform_eup<-as.formula(change_up~.-dsstox_substance_id-chnm-change_down)
+
+eup_mo_rep_cv<-rf_rep_cv(seed=12, mtry1=sqrt(1037),formula =moform_eup, data1=fps_eaM)
+
+eup_mo_rep_cv
+```
+
+
+```{r eval=F}
+moform_edown<-as.formula(change_down~.-dsstox_substance_id-chnm-change_up)
+
+edown_mo_rep_cv<-rf_rep_cv(seed=12, mtry1=sqrt(1037),formula =moform_edown, data1=fps_eaM)
+
+edown_mo_rep_cv
+```
+
+
+```{r eval=F}
+cv_results_estrogens<-rbind(as.vector(eup_opera_rep_cv), as.vector(edown_opera_rep_cv),as.vector(eup_chemo_rep_cv), as.vector(edown_chemo_rep_cv),as.vector(eup_oc_rep_cv), as.vector(edown_oc_rep_cv),as.vector(eup_morg_rep_cv), as.vector(edown_morg_rep_cv),as.vector(eup_mo_rep_cv), as.vector(edown_mo_rep_cv))
+colnames(cv_results_estrogens)<-c("Sensitivity","Specificity","Accuracy","Kappa","OOB")
+cv_results_estrogens$Features<-c("OPERA","OPERA","Chemotypes","Chemotypes","OPERA and Chemotypes","OPERA and Chemotypes","Morgan fingerprints","Morgan fingerprints","OPERA and Morgan","OPERA and Morgan")
+cv_results_estrogens$Direction<-rep(c("Estrogen Up","Estrogen Down"),6)
+
+```
+
+
+
+
+## Androgens data cleaning
+
+```{r message=F, warning=F}
+androgens_op_ch<-read_excel(path =  "Supp8_Estrogens_Androgens_Data.xlsx", sheet = 5)
+androgens_op_ch<-androgens_op_ch[,-1]
+colnames(androgens_op_ch)[1]<-"dsstox_substance_id"
+
+
+androgens_op_ch2<-left_join(androgen, androgens_op_ch, by="dsstox_substance_id")
+
+androgens_op_ch2<-androgens_op_ch2[!duplicated(androgens_op_ch2),]
+
+
+androgens_op_ch2[,7:748]<-sapply(androgens_op_ch2[,7:748], as.numeric)
+
+
+androgens_op_ch3<-androgens_op_ch2[,-which(colSums(androgens_op_ch2[,7:747])==0)]
+
+androgens_op_ch3<-na.omit(androgens_op_ch3)
+
+
+androgens_op_ch3$change_up<-as.factor(androgens_op_ch3$change_up)
+
+androgens_op_ch3<- androgens_op_ch3 %>% mutate(change_up = case_when(change_up =="1" ~"positive"
+,change_up=="0" ~"negative"))
+
+androgens_op_ch3$change_down<-as.factor(androgens_op_ch3$change_down)
+
+androgens_op_ch3<- androgens_op_ch3 %>% mutate(change_down = case_when(change_down =="1" ~"positive"
+,change_down=="0" ~"negative"))
+
+androgens_op_ch3$change_down<-as.factor(androgens_op_ch3$change_down)
+
+androgens_op_ch3$change_up<-as.factor(androgens_op_ch3$change_up)
+
+
+androgens_op_ch3$change_down <- relevel(androgens_op_ch3$change_down, ref = "positive")
+
+androgens_op_ch3$change_up <- relevel(androgens_op_ch3$change_up, ref = "positive")
+
+```
+
+
+
+## Androgen opera only
+
+```{r eval=F}
+operaform_aup<-as.formula(change_up~`ATMOSPHERIC_HYDROXYLATION_RATE_(AOH)_CM3/MOLECULE*SEC_OPERA_PRED`+BIOCONCENTRATION_FACTOR_OPERA_PRED+BIODEGRADATION_HALF_LIFE_DAYS_DAYS_OPERA_PRED+BOILING_POINT_DEGC_OPERA_PRED+       `HENRYS_LAW_ATM-M3/MOLE_OPERA_PRED`+OPERA_KM_DAYS_OPERA_PRED+OCTANOL_AIR_PARTITION_COEFF_LOGKOA_OPERA_PRED+`SOIL_ADSORPTION_COEFFICIENT_KOC_L/KG_OPERA_PRED`+OCTANOL_WATER_PARTITION_LOGP_OPERA_PRED+MELTING_POINT_DEGC_OPERA_PRED+VAPOR_PRESSURE_MMHG_OPERA_PRED+`WATER_SOLUBILITY_MOL/L_OPERA_PRED`+AVERAGE_MASS)
+
+aup_opera_rep_cv<-rf_rep_cv(seed=12, mtry1=sqrt(13),formula =operaform_aup, data1=androgens_op_ch3)
+
+aup_opera_rep_cv
+
+```
+
+```{r eval=F}
+operaform_adown<-as.formula(change_down~`ATMOSPHERIC_HYDROXYLATION_RATE_(AOH)_CM3/MOLECULE*SEC_OPERA_PRED`+BIOCONCENTRATION_FACTOR_OPERA_PRED+BIODEGRADATION_HALF_LIFE_DAYS_DAYS_OPERA_PRED+BOILING_POINT_DEGC_OPERA_PRED+       `HENRYS_LAW_ATM-M3/MOLE_OPERA_PRED`+OPERA_KM_DAYS_OPERA_PRED+OCTANOL_AIR_PARTITION_COEFF_LOGKOA_OPERA_PRED+`SOIL_ADSORPTION_COEFFICIENT_KOC_L/KG_OPERA_PRED`+OCTANOL_WATER_PARTITION_LOGP_OPERA_PRED+MELTING_POINT_DEGC_OPERA_PRED+VAPOR_PRESSURE_MMHG_OPERA_PRED+`WATER_SOLUBILITY_MOL/L_OPERA_PRED`+AVERAGE_MASS)
+
+adown_opera_rep_cv<-rf_rep_cv(seed=12, mtry1=sqrt(13),formula =operaform_adown, data1=androgens_op_ch3)
+
+adown_opera_rep_cv
+```
+
+## Androgens Chemotypes only
+
+```{r eval=F}
+chemoform_aup<-as.formula(change_up~.-dsstox_substance_id-chnm-change-change_down-PREFERRED_NAME-`ATMOSPHERIC_HYDROXYLATION_RATE_(AOH)_CM3/MOLECULE*SEC_OPERA_PRED`-BIOCONCENTRATION_FACTOR_OPERA_PRED-BIODEGRADATION_HALF_LIFE_DAYS_DAYS_OPERA_PRED-BOILING_POINT_DEGC_OPERA_PRED-       `HENRYS_LAW_ATM-M3/MOLE_OPERA_PRED`-OPERA_KM_DAYS_OPERA_PRED-OCTANOL_AIR_PARTITION_COEFF_LOGKOA_OPERA_PRED-`SOIL_ADSORPTION_COEFFICIENT_KOC_L/KG_OPERA_PRED`-OCTANOL_WATER_PARTITION_LOGP_OPERA_PRED-MELTING_POINT_DEGC_OPERA_PRED-VAPOR_PRESSURE_MMHG_OPERA_PRED-`WATER_SOLUBILITY_MOL/L_OPERA_PRED`-AVERAGE_MASS)
+
+aup_chemo_rep_cv<-rf_rep_cv(seed=12, mtry1=sqrt(403),formula =chemoform_aup, data1=androgens_op_ch3)
+
+aup_chemo_rep_cv
+```
+
+```{r eval=F}
+chemoform_adown<-as.formula(change_down~.-dsstox_substance_id-chnm-change-change_up-PREFERRED_NAME-`ATMOSPHERIC_HYDROXYLATION_RATE_(AOH)_CM3/MOLECULE*SEC_OPERA_PRED`-BIOCONCENTRATION_FACTOR_OPERA_PRED-BIODEGRADATION_HALF_LIFE_DAYS_DAYS_OPERA_PRED-BOILING_POINT_DEGC_OPERA_PRED-       `HENRYS_LAW_ATM-M3/MOLE_OPERA_PRED`-OPERA_KM_DAYS_OPERA_PRED-OCTANOL_AIR_PARTITION_COEFF_LOGKOA_OPERA_PRED-`SOIL_ADSORPTION_COEFFICIENT_KOC_L/KG_OPERA_PRED`-OCTANOL_WATER_PARTITION_LOGP_OPERA_PRED-MELTING_POINT_DEGC_OPERA_PRED-VAPOR_PRESSURE_MMHG_OPERA_PRED-`WATER_SOLUBILITY_MOL/L_OPERA_PRED`-AVERAGE_MASS)
+
+adown_chemo_rep_cv<-rf_rep_cv(seed=12, mtry1=sqrt(403),formula =chemoform_adown, data1=androgens_op_ch3)
+```
+
+
+## Androgens Chemotypes and OPERA
+
+```{r eval=F}
+ocform_aup<-as.formula(change_up~.-dsstox_substance_id-chnm-change-change_down-PREFERRED_NAME)
+
+aup_oc_rep_cv<-rf_rep_cv(seed=12, mtry1=sqrt(416),formula =ocform_aup, data1=androgens_op_ch3)
+```
+
+```{r eval=F}
+ocform_adown<-as.formula(change_down~.-dsstox_substance_id-chnm-change-change_up-PREFERRED_NAME)
+
+adown_oc_rep_cv<-rf_rep_cv(seed=12, mtry1=sqrt(416),formula =ocform_adown, data1=androgens_op_ch3)
+```
+
+## Morgan Fingerprint RF Estrogens Data cleaning
+```{r}
+
+#making sure the two data frames have the same substance in the exact same order so I can directly add onto them
+fps_androgenM<-arrange(fps_eaM, dsstox_substance_id)
+androgens_op_ch3<-arrange(androgens_op_ch3, dsstox_substance_id)
+androgens_op_ch3<-androgens_op_ch3[-which(duplicated(androgens_op_ch3$dsstox_substance_id)),]
+
+#adding fold changes
+fps_androgenM$change_up<-androgens_op_ch3$change_up
+fps_androgenM$change_down<-androgens_op_ch3$change_down
+
+#adding opera
+fps_androgenM[,1029:1042]<-androgens_op_ch3[,410:422]
+
+```
+
+
+## Androgens Morgan Fingerprints only
+
+```{r eval=F}
+morgform_aup<-as.formula(change_up~.-dsstox_substance_id-chnm-change_down-`ATMOSPHERIC_HYDROXYLATION_RATE_(AOH)_CM3/MOLECULE*SEC_OPERA_PRED`-BIOCONCENTRATION_FACTOR_OPERA_PRED-BIODEGRADATION_HALF_LIFE_DAYS_DAYS_OPERA_PRED-BOILING_POINT_DEGC_OPERA_PRED-       `HENRYS_LAW_ATM-M3/MOLE_OPERA_PRED`-OPERA_KM_DAYS_OPERA_PRED-OCTANOL_AIR_PARTITION_COEFF_LOGKOA_OPERA_PRED-`SOIL_ADSORPTION_COEFFICIENT_KOC_L/KG_OPERA_PRED`-OCTANOL_WATER_PARTITION_LOGP_OPERA_PRED-MELTING_POINT_DEGC_OPERA_PRED-VAPOR_PRESSURE_MMHG_OPERA_PRED-`WATER_SOLUBILITY_MOL/L_OPERA_PRED`-AVERAGE_MASS)
+
+aup_morg_rep_cv<-rf_rep_cv(seed=12, mtry1=sqrt(1024),formula =morgform_aup, data1=fps_androgenM)
+
+aup_morg_rep_cv
+```
+
+
+```{r eval=F}
+morgform_adown<-as.formula(change_down~.-dsstox_substance_id-chnm-change_up-`ATMOSPHERIC_HYDROXYLATION_RATE_(AOH)_CM3/MOLECULE*SEC_OPERA_PRED`-BIOCONCENTRATION_FACTOR_OPERA_PRED-BIODEGRADATION_HALF_LIFE_DAYS_DAYS_OPERA_PRED-BOILING_POINT_DEGC_OPERA_PRED-       `HENRYS_LAW_ATM-M3/MOLE_OPERA_PRED`-OPERA_KM_DAYS_OPERA_PRED-OCTANOL_AIR_PARTITION_COEFF_LOGKOA_OPERA_PRED-`SOIL_ADSORPTION_COEFFICIENT_KOC_L/KG_OPERA_PRED`-OCTANOL_WATER_PARTITION_LOGP_OPERA_PRED-MELTING_POINT_DEGC_OPERA_PRED-VAPOR_PRESSURE_MMHG_OPERA_PRED-`WATER_SOLUBILITY_MOL/L_OPERA_PRED`-AVERAGE_MASS)
+
+adown_morg_rep_cv<-rf_rep_cv(seed=12, mtry1=sqrt(1024),formula =morgform_adown, data1=fps_androgenM)
+
+adown_morg_rep_cv
+```
+
+## Androgens Morgan Fingerprints and OPERA
+
+```{r eval=F}
+moform_aup<-as.formula(change_up~.-dsstox_substance_id-chnm-change_down)
+
+aup_mo_rep_cv<-rf_rep_cv(seed=12, mtry1=sqrt(1037),formula =moform_aup, data1=fps_androgenM)
+
+aup_mo_rep_cv
+```
+
+
+```{r eval=F}
+moform_adown<-as.formula(change_down~.-dsstox_substance_id-chnm-change_up)
+
+adown_mo_rep_cv<-rf_rep_cv(seed=12, mtry1=sqrt(1037),formula =moform_adown, data1=fps_androgenM)
+
+adown_mo_rep_cv
+```
+
+
+```{r eval=F}
+cv_results_androgens<-data.frame(rbind(unlist(aup_opera_rep_cv), unlist(adown_opera_rep_cv),unlist(aup_chemo_rep_cv), unlist(adown_chemo_rep_cv),unlist(aup_oc_rep_cv), unlist(adown_oc_rep_cv),unlist(aup_morg_rep_cv), unlist(adown_morg_rep_cv),unlist(aup_mo_rep_cv), unlist(adown_mo_rep_cv)))
+cv_results_androgens
+
+
+colnames(cv_results_androgens)<-c("Sensitivity","Specificity","Accuracy","Kappa","OOB")
+cv_results_androgens$Features<-c("OPERA","OPERA","Chemotypes","Chemotypes","OPERA and Chemotypes","OPERA and Chemotypes","Morgan fingerprints","Morgan fingerprints","OPERA and Morgan","OPERA and Morgan")
+cv_results_androgens$Direction<-rep(c("Androgen Up","Androgen Down"),5)
+```
+
+## Output for Estrogen and Androgen RF models
+```{r}
+cv_resultsEA<-read_excel(path = "Supp3_RandomForest_Outputs.xlsx", sheet = 9)
+
+cv_resultsEA
+```
+
+
+# Supplemental File : Opera NN Models {.tabset .tabset-fade .tabset-pills}
+
+## Euclidean distances for OPERA and Chemotype jaccard
+
+```{r}
+opera13<-operafull2[,c(1:14)]
+opera13<-opera13[!duplicated(opera13),]
+rownames(opera13)<-opera13$chnm
+opera13<-opera13[,-1]
+opera13<-na.omit(opera13)
+opera13<-scale(opera13)
+```
+
+```{r creates 1400x1400 matrix of eucledian distances}
+disty<-dist(opera13, method="euclidean")
+disty<-as.matrix(disty)
+disty<-data.frame(disty)
+colnames(disty)<-rownames(disty)
+disty[disty == 0] <- NA
+
+jaccard_for_opera<-jaccard
+jaccard_for_opera<-jaccard_for_opera[rownames(jaccard_for_opera)%in%colnames(disty),colnames(jaccard_for_opera)%in%colnames(disty)]
+
+colnames(jaccard_for_opera)<-sort(colnames(jaccard_for_opera))
+colnames(disty)<-sort(colnames(disty))
+```
+
+
+
+```{r eval=F}
+try13_plusopera<-function(r,w){
+nebJO<-function(x){
+g<-which(colnames(jaccard_for_opera)==x)
+g2<-data.frame(jaccard_for_opera[,g],rownames(jaccard_for_opera))
+g2<-arrange(g2, desc(jaccard_for_opera...g.))
+g3<-slice(g2, 1:r)
+g6<-subset(operafull2dis, chnm %in% g3$rownames.jaccard_for_opera.)
+g3<-arrange(g3, rownames.jaccard_for_opera.)
+g6<-arrange(g6, chnm)
+
+h2<-data.frame(disty[,g],rownames(disty))
+h2<-arrange(h2,disty...g.)
+h3<-slice(h2, 1:w)
+h6<-subset(operafull2dis, chnm %in% h3$rownames.disty.)
+h3<-arrange(h3, rownames.disty.)
+h6<-arrange(h6, chnm)
+
+
+(sum(g3$jaccard_for_opera...g.*g6$status01)+sum(h3$disty...g.*h6$status01))/(sum(h3$disty...g.)+sum(g3$jaccard_for_opera...g.))
+}
+
+thr3<-function(z,y){
+operaNN<-data.frame(sapply(colnames(jaccard_for_opera), nebJO))
+operaNN$chnm<-colnames(jaccard_for_opera)
+operaNN <- operaNN %>% mutate(sapply.colnames.jaccard_for_opera...nebJO. = case_when(sapply.colnames.jaccard_for_opera...nebJO. > z ~1
+,sapply.colnames.jaccard_for_opera...nebJO. < y ~0))
+
+c<-confusionMatrix(as.factor(operaNN$sapply.colnames.jaccard_for_opera...nebJO.), as.factor(operafull2dis$status01),positive="1")
+sens<-c$byClass[1]
+spef<-c$byClass[2]
+
+hh<-c(spef,sens,sum(c$table),mean(c(spef,sens)))
+
+hh
+}
+
+
+wow4<-mapply(thr3, c(.7,.8,.9), .2)
+wow4<-t(wow4)
+colnames(wow4)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+wow5<-mapply(thr3, c(.7,.8,.9), .1)
+wow5<-t(wow5)
+colnames(wow5)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+thrd<-data.frame(rbind(wow4,wow5))
+
+thrd$upper<-rep(c(.7,.8,.9),2)
+thrd$lower<-c(rep(.2,3),rep(.1,3))
+thrd$jaccardN<-r
+thrd$operaN<-w
+thrd
+
+} 
+
+rtry<-c(1,2,3,4,5,7,10,12,15,20,25,30)
+
+
+rtryM<-expand.grid(rtry, rtry)
+#operaNNmodels<-mapply(try13_plusopera, rtryM[,1], rtryM[,2])
+
+operaNNdf<-data.frame(matrix(NA, ncol=8, nrow=864))
+
+operaNNdf[,1]<-unlist(operaNNmodels[seq(1, 1152,8)])
+operaNNdf[,2]<-unlist(operaNNmodels[seq(2, 1152,8)])
+operaNNdf[,3]<-unlist(operaNNmodels[seq(3, 1152,8)])
+operaNNdf[,4]<-unlist(operaNNmodels[seq(4, 1152,8)])
+operaNNdf[,5]<-unlist(operaNNmodels[seq(5, 1152,8)])
+operaNNdf[,6]<-unlist(operaNNmodels[seq(6, 1152,8)])
+operaNNdf[,7]<-unlist(operaNNmodels[seq(7, 1152,8)])
+operaNNdf[,8]<-unlist(operaNNmodels[seq(8, 1152,8)])
+
+colnames(operaNNdf)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy","Upper","Lower","Jaccard","OPERA")
+
+```
+
+```{r}
+operaNNdf1<-read_excel(path = "Supp6_Nearest_Neighbor_PlusOpera.xlsx", sheet = 1)
+arrange(operaNNdf1,desc(`Balanced Accuracy`))
+```
+
+
+## Euclidean distance only 
+
+```{r eval=F}
+try13_operaonly<-function(w){
+nebJO<-function(x){
+g<-which(colnames(disty)==x)
+h2<-data.frame(disty[,g],rownames(disty))
+h2<-arrange(h2,disty...g.)
+h3<-slice(h2, 1:w)
+h6<-subset(operafull2dis, chnm %in% h3$rownames.disty.)
+h3<-arrange(h3, rownames.disty.)
+h6<-arrange(h6, chnm)
+
+
+sum(h3$disty...g.*h6$status01)/sum(h3$disty...g.)
+}
+
+thr3<-function(z,y){
+operaNN<-data.frame(sapply(colnames(jaccard_for_opera), nebJO))
+operaNN$chnm<-colnames(jaccard_for_opera)
+operaNN <- operaNN %>% mutate(sapply.colnames.jaccard_for_opera...nebJO. = case_when(sapply.colnames.jaccard_for_opera...nebJO. > z ~1
+,sapply.colnames.jaccard_for_opera...nebJO. < y ~0))
+
+c<-confusionMatrix(as.factor(operaNN$sapply.colnames.jaccard_for_opera...nebJO.), as.factor(operafull2dis$status01),positive="1")
+sens<-c$byClass[1]
+spef<-c$byClass[2]
+
+hh<-c(spef,sens,sum(c$table),mean(c(spef,sens)))
+
+hh
+}
+
+
+wow4<-mapply(thr3, c(.7,.8,.9), .2)
+wow4<-t(wow4)
+colnames(wow4)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+wow5<-mapply(thr3, c(.7,.8,.9), .1)
+wow5<-t(wow5)
+colnames(wow5)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+thrd<-data.frame(rbind(wow4,wow5))
+
+thrd$upper<-rep(c(.7,.8,.9),2)
+thrd$lower<-c(rep(.2,3),rep(.1,3))
+
+thrd
+
+} 
+
+
+operaNNdf_only1<-try13_operaonly(1)
+operaNNdf_only2<-try13_operaonly(2)
+operaNNdf_only3<-try13_operaonly(3)
+operaNNdf_only4<-try13_operaonly(4)
+operaNNdf_only5<-try13_operaonly(5)
+operaNNdf_only7<-try13_operaonly(7)
+operaNNdf_only10<-try13_operaonly(10)
+operaNNdf_only12<-try13_operaonly(12)
+operaNNdf_only15<-try13_operaonly(15)
+operaNNdf_only20<-try13_operaonly(20)
+operaNNdf_only25<-try13_operaonly(25)
+operaNNdf_only30<-try13_operaonly(30)
+
+NNdf_operaonly<-data.frame(rbind(operaNNdf_only1,operaNNdf_only2,operaNNdf_only3,operaNNdf_only4,operaNNdf_only5,operaNNdf_only7,operaNNdf_only10,operaNNdf_only12,operaNNdf_only15,operaNNdf_only20,operaNNdf_only25,operaNNdf_only30))
+
+NNdf_operaonly$Neighbors<-c(rep(1,6),rep(2,6),rep(3,6),rep(4,6),rep(5,6),rep(7,6),rep(10,6),rep(12,6),rep(15,6),rep(20,6),rep(25,6),rep(30,6))
+```
+
+```{r}
+operaNNdf2<-read_excel(path = "Supp6_Nearest_Neighbor_PlusOpera.xlsx", sheet = 2)
+arrange(operaNNdf2,desc(Balanced.Accuracy))
+```
+
+
+## HDVM distances
+
+```{r eval=F}
+library(UBL)
+operachemo528<-operafull2dis[,-c(1,531)]
+disty_HVDM<-distances(529,dat=operachemo528, dist="HVDM")
+colnames(disty_HVDM)<-operafull2dis$chnm
+rownames(disty_HVDM)<-operafull2dis$chnm
+
+```
+
+
+```{r eval=F}
+try13_HVDM<-function(w){
+nebJO<-function(x){
+g<-which(colnames(disty_HVDM)==x)
+h2<-data.frame(disty_HVDM[,g],rownames(disty_HVDM))
+h2<-arrange(h2,disty_HVDM...g.)
+h3<-slice(h2, 1:w)
+h6<-subset(operafull2dis, chnm %in% h3$rownames.disty_HVDM.)
+h3<-arrange(h3, rownames.disty_HVDM.)
+h6<-arrange(h6, chnm)
+
+
+sum(h3$disty_HVDM...g.*h6$status01)/sum(h3$disty_HVDM...g.)
+}
+
+thr3<-function(z,y){
+operaNN<-data.frame(sapply(colnames(jaccard_for_opera), nebJO))
+operaNN$chnm<-colnames(jaccard_for_opera)
+operaNN <- operaNN %>% mutate(sapply.colnames.jaccard_for_opera...nebJO. = case_when(sapply.colnames.jaccard_for_opera...nebJO. > z ~1
+,sapply.colnames.jaccard_for_opera...nebJO. < y ~0))
+
+c<-confusionMatrix(as.factor(operaNN$sapply.colnames.jaccard_for_opera...nebJO.), as.factor(operafull2dis$status01),positive="1")
+sens<-c$byClass[1]
+spef<-c$byClass[2]
+
+hh<-c(spef,sens,sum(c$table),mean(c(spef,sens)))
+
+hh
+}
+
+
+wow4<-mapply(thr3, c(.5,.6,.7,.8,.9), .2)
+wow4<-t(wow4)
+colnames(wow4)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+wow5<-mapply(thr3, c(.5,.6,.7,.8,.9), .1)
+wow5<-t(wow5)
+colnames(wow5)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+thrd<-data.frame(rbind(wow4,wow5))
+
+thrd$upper<-rep(c(5.,.6,.7,.8,.9),2)
+thrd$lower<-c(rep(.2,5),rep(.1,5))
+
+thrd
+
+} 
+
+HVDMNN2<-try13_HVDM(2)
+HVDMNN3<-try13_HVDM(3)
+HVDMNN4<-try13_HVDM(4)
+HVDMNN5<-try13_HVDM(5)
+HVDMNN7<-try13_HVDM(7)
+HVDMNN10<-try13_HVDM(10)
+HVDMNN12<-try13_HVDM(12)
+HVDMNN15<-try13_HVDM(15)
+HVDMNN20<-try13_HVDM(20)
+HVDMNN25<-try13_HVDM(25)
+HVDMNN30<-try13_HVDM(30)
+
+
+
+HVDMNNdf<-data.frame(rbind(HVDMNN2,HVDMNN3,HVDMNN4,HVDMNN5,HVDMNN7,HVDMNN10,HVDMNN12,HVDMNN15,HVDMNN20,HVDMNN25,HVDMNN30))
+
+HVDMNNdf$Neighbors<-c(rep(2,6),rep(3,6),rep(4,6),rep(5,6),rep(7,6),rep(10,6),rep(12,6),rep(15,6),rep(20,6),rep(25,6),rep(30,6))
+
+```
+
+```{r}
+operaNNdf3<-read_excel(path = "Supp6_Nearest_Neighbor_PlusOpera.xlsx", sheet = 3)
+arrange(operaNNdf3,desc(Balanced.Accuracy))
+```
+
+
+## Euclidean distances for OPERA and Morgan fingerprint jaccard
+
+```{r}
+
+fpsJ_for_opera<-fpsJ
+fpsJ_for_opera<-fpsJ_for_opera[rownames(fpsJ_for_opera)%in%colnames(disty),colnames(fpsJ_for_opera)%in%colnames(disty)]
+
+colnames(fpsJ_for_opera)<-sort(colnames(fpsJ_for_opera))
+colnames(disty)<-sort(colnames(disty))
+```
+
+```{r eval=F}
+morgan_try13_plusopera<-function(r,w){
+nebJO<-function(x){
+g<-which(colnames(fpsJ_for_opera)==x)
+g2<-data.frame(fpsJ_for_opera[,g],rownames(fpsJ_for_opera))
+g2<-arrange(g2, desc(fpsJ_for_opera...g.))
+g3<-slice(g2, 1:r)
+g6<-subset(operafull2dis, chnm %in% g3$rownames.fpsJ_for_opera.)
+g3<-arrange(g3, rownames.fpsJ_for_opera.)
+g6<-arrange(g6, chnm)
+
+h2<-data.frame(disty[,g],rownames(disty))
+h2<-arrange(h2,disty...g.)
+h3<-slice(h2, 1:w)
+h6<-subset(operafull2dis, chnm %in% h3$rownames.disty.)
+h3<-arrange(h3, rownames.disty.)
+h6<-arrange(h6, chnm)
+
+
+(sum(g3$fpsJ_for_opera...g.*g6$status01)+sum(h3$disty...g.*h6$status01))/(sum(h3$disty...g.)+sum(g3$fpsJ_for_opera...g.))
+}
+
+thr3<-function(z,y){
+operaNN<-data.frame(sapply(colnames(fpsJ_for_opera), nebJO))
+operaNN$chnm<-colnames(fpsJ_for_opera)
+operaNN <- operaNN %>% mutate(sapply.colnames.fpsJ_for_opera...nebJO. = case_when(sapply.colnames.fpsJ_for_opera...nebJO. > z ~1
+,sapply.colnames.fpsJ_for_opera...nebJO. < y ~0))
+
+c<-confusionMatrix(as.factor(operaNN$sapply.colnames.fpsJ_for_opera...nebJO.), as.factor(operafull2dis$status01),positive="1")
+sens<-c$byClass[1]
+spef<-c$byClass[2]
+
+hh<-c(spef,sens,sum(c$table),mean(c(spef,sens)))
+
+hh
+}
+
+
+wow4<-mapply(thr3, c(.7,.8,.9), .2)
+wow4<-t(wow4)
+colnames(wow4)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+wow5<-mapply(thr3, c(.7,.8,.9), .1)
+wow5<-t(wow5)
+colnames(wow5)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy")
+
+thrd<-data.frame(rbind(wow4,wow5))
+
+thrd$upper<-rep(c(.7,.8,.9),2)
+thrd$lower<-c(rep(.2,3),rep(.1,3))
+thrd$fpsJN<-r
+thrd$operaN<-w
+thrd
+
+} 
+
+
+
+
+
+rtry<-c(1,2,3,4,5,7,10,12,15,20,25,30)
+
+
+rtryM<-expand.grid(rtry, rtry)
+morgan_operaNNmodels<-mapply(morgan_try13_plusopera, rtryM[,1], rtryM[,2])
+
+morgan_operaNNdf<-data.frame(matrix(NA, ncol=8, nrow=864))
+
+morgan_operaNNdf[,1]<-unlist(morgan_operaNNmodels[seq(1, 1152,8)])
+morgan_operaNNdf[,2]<-unlist(morgan_operaNNmodels[seq(2, 1152,8)])
+morgan_operaNNdf[,3]<-unlist(morgan_operaNNmodels[seq(3, 1152,8)])
+morgan_operaNNdf[,4]<-unlist(morgan_operaNNmodels[seq(4, 1152,8)])
+morgan_operaNNdf[,5]<-unlist(morgan_operaNNmodels[seq(5, 1152,8)])
+morgan_operaNNdf[,6]<-unlist(morgan_operaNNmodels[seq(6, 1152,8)])
+morgan_operaNNdf[,7]<-unlist(morgan_operaNNmodels[seq(7, 1152,8)])
+morgan_operaNNdf[,8]<-unlist(morgan_operaNNmodels[seq(8, 1152,8)])
+
+colnames(morgan_operaNNdf)<-c("Specificity","Sensitivity","Number of Chemicals","Balanced Accuracy","Upper","Lower","Jaccard","OPERA")
+
+```
+
+```{r}
+operaNNdf4<-read_excel(path = "Supp6_Nearest_Neighbor_PlusOpera.xlsx", sheet = 4)
+arrange(operaNNdf4,desc(`Balanced Accuracy`))
+```
+
+
